@@ -1,0 +1,19 @@
+{
+  "session": {
+    "user_name": "Vess Finishing",
+    "token": "urqI59aZpuawpKCg0obK0KzPiq+Ul6/UsMCX3Lma2LU=",
+    "entity_id": "1380",
+    "status": "97",
+    "status_label": "Finishing"
+  },
+  "scans": [],
+  "updates": [
+    {
+      "id": "UPD-20260819071218371447",
+      "time": "07:12:18",
+      "barcode": "UPD_1234567",
+      "commit": "1234567",
+      "result": "fail"
+    }
+  ]
+}
