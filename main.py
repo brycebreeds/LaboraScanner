@@ -1,3 +1,4 @@
+import platform
 import tkinter as tk
 from tkinter import ttk, messagebox
 import json
@@ -15,6 +16,30 @@ from datetime import datetime
 from pathlib import Path
 
 from UniAPI import UniAPI
+
+# ── Git setup ─────────────────────────────────────────────────────────────────
+# The launcher sets LABORA_GIT to the bundled portable git exe on Windows.
+# On Linux/macOS it is not set, so we fall back to whatever 'git' is in PATH.
+_GIT_EXE = os.environ.get("LABORA_GIT", "git")
+
+# Portable git on Windows has its own config scope and won't see the global
+# ~/.gitconfig the launcher wrote. Pass safe.directory=* inline on every
+# git call so ownership checks never block us regardless of config files.
+_GIT_SAFE = ["-c", "safe.directory=*"]
+
+def _check_git_available() -> bool:
+    """Return True if git is present and usable."""
+    try:
+        r = subprocess.run([_GIT_EXE, "--version"], capture_output=True, timeout=5)
+        return r.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+GIT_AVAILABLE = _check_git_available()
+if not GIT_AVAILABLE:
+    logging.getLogger("scanner").warning(
+        "git not found — UPD_ update barcodes will be disabled"
+    )
 
 # ── Connectivity debug patch ───────────────────────────────────────────────────
 # We wrap the two low-level transport methods so that when DEBUG_CONNECTIVITY is
@@ -465,9 +490,11 @@ def fetch_users_from_api(api, settings):
 
 # ── Git helpers ───────────────────────────────────────────────────────────────
 def git_current_hash(short=True):
-    """Return current HEAD commit hash, or None on failure."""
+    """Return current HEAD commit hash, or None if git is unavailable."""
+    if not GIT_AVAILABLE:
+        return None
     try:
-        args = ["git", "rev-parse", "--short=7", "HEAD"] if short else ["git", "rev-parse", "HEAD"]
+        args = [_GIT_EXE] + _GIT_SAFE + (["rev-parse", "--short=7", "HEAD"] if short else ["rev-parse", "HEAD"])
         result = subprocess.run(args, cwd=SCRIPT_DIR, capture_output=True, text=True, timeout=10)
         if result.returncode == 0:
             return result.stdout.strip()
@@ -481,10 +508,12 @@ def git_checkout_and_pull(commit_hash):
     Fetch from origin and checkout the specified commit hash.
     Returns (success: bool, message: str)
     """
+    if not GIT_AVAILABLE:
+        return False, "git is not available on this machine"
     try:
         log.info(f"git fetch origin")
         fetch = subprocess.run(
-            ["git", "fetch", "origin"],
+            [_GIT_EXE] + _GIT_SAFE + ["fetch", "origin"],
             cwd=SCRIPT_DIR, capture_output=True, text=True, timeout=30
         )
         log.debug(f"fetch stdout: {fetch.stdout}  stderr: {fetch.stderr}")
@@ -493,7 +522,7 @@ def git_checkout_and_pull(commit_hash):
 
         log.info(f"git checkout {commit_hash}")
         checkout = subprocess.run(
-            ["git", "checkout", commit_hash],
+            [_GIT_EXE] + _GIT_SAFE + ["checkout", commit_hash],
             cwd=SCRIPT_DIR, capture_output=True, text=True, timeout=15
         )
         log.debug(f"checkout stdout: {checkout.stdout}  stderr: {checkout.stderr}")
@@ -508,9 +537,14 @@ def git_checkout_and_pull(commit_hash):
 
 
 def restart_app():
-    """Replace the current process with a fresh instance."""
+    """Restart the application — works on Windows, Linux, and macOS."""
     log.info("Restarting app…")
-    os.execv(sys.executable, [sys.executable] + sys.argv)
+    # os.execv is not reliable on Windows; use subprocess + exit instead.
+    if platform.system() == "Windows":
+        subprocess.Popen([sys.executable] + sys.argv)
+        sys.exit(0)
+    else:
+        os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 
