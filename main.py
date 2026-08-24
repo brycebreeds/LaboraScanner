@@ -520,9 +520,20 @@ def git_checkout_and_pull(commit_hash):
         if fetch.returncode != 0:
             return False, f"git fetch failed: {fetch.stderr.strip()}"
 
+        # Exclude runtime files from checkout — these belong to the site,
+        # not the repo, and must never be overwritten by an update.
+        runtime_files = ["scanner_data.json", "settings.json", "launcher.log",
+                         ".deps_installed"]
+        for f in runtime_files:
+            skip = subprocess.run(
+                [_GIT_EXE] + _GIT_SAFE + ["update-index", "--skip-worktree", f],
+                cwd=SCRIPT_DIR, capture_output=True, text=True, timeout=10
+            )
+            log.debug(f"skip-worktree {f}: {skip.returncode}")
+
         log.info(f"git checkout {commit_hash}")
         checkout = subprocess.run(
-            [_GIT_EXE] + _GIT_SAFE + ["checkout", commit_hash],
+            [_GIT_EXE] + _GIT_SAFE + ["checkout", "-f", commit_hash],
             cwd=SCRIPT_DIR, capture_output=True, text=True, timeout=15
         )
         log.debug(f"checkout stdout: {checkout.stdout}  stderr: {checkout.stderr}")
