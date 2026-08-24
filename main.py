@@ -63,9 +63,16 @@ UniAPI.do_post = _debug_do_post
 UniAPI.do_get  = _debug_do_get
 
 # ── Files ─────────────────────────────────────────────────────────────────────
-SCRIPT_DIR    = Path(__file__).parent
-SETTINGS_FILE = SCRIPT_DIR / "settings.json"
-DATA_FILE     = SCRIPT_DIR / "scanner_data.json"
+# When launched via the LABORA launcher exe, LABORA_ROOT points to the install
+# directory so settings/data files are always found next to the exe.
+_labora_root = os.environ.get("LABORA_ROOT")
+if _labora_root:
+    SCRIPT_DIR = Path(_labora_root)
+else:
+    SCRIPT_DIR = Path(__file__).parent
+
+SETTINGS_FILE  = SCRIPT_DIR / "settings.json"
+DATA_FILE      = SCRIPT_DIR / "scanner_data.json"
 RETRY_INTERVAL = 30    # seconds
 SYNC_INTERVAL  = 3600  # seconds — hourly SFTP sync
 
@@ -108,12 +115,24 @@ ACCENT      = RED
 ACCENT_DIM  = RED_DARK
 ACCENT_BG   = RED_LIGHT
 
-FONT        = ("Segoe UI", 10)
-FONT_BOLD   = ("Segoe UI", 10, "bold")
-FONT_MONO   = ("Courier New", 10)
-FONT_LARGE  = ("Segoe UI", 15, "bold")
-FONT_SM     = ("Segoe UI", 9)
-FONT_XS     = ("Segoe UI", 8)
+# Cross-platform fonts — Segoe UI is Windows only
+_SYS = platform.system()
+if _SYS == "Darwin":
+    _UI_FONT   = "SF Pro Text"
+    _MONO_FONT = "Menlo"
+elif _SYS == "Linux":
+    _UI_FONT   = "DejaVu Sans"
+    _MONO_FONT = "DejaVu Sans Mono"
+else:
+    _UI_FONT   = "Segoe UI"
+    _MONO_FONT = "Courier New"
+
+FONT        = (_UI_FONT, 10)
+FONT_BOLD   = (_UI_FONT, 10, "bold")
+FONT_MONO   = (_MONO_FONT, 10)
+FONT_LARGE  = (_UI_FONT, 15, "bold")
+FONT_SM     = (_UI_FONT, 9)
+FONT_XS     = (_UI_FONT, 8)
 
 # ── Barcode patterns ──────────────────────────────────────────────────────────
 BATCH_RE    = re.compile(r"^BAT_\d+$",          re.IGNORECASE)
@@ -700,9 +719,9 @@ class ScannerApp(tk.Tk):
 
         logo_row = tk.Frame(card, bg=WHITE)
         logo_row.pack(anchor="w", pady=(0, 20))
-        tk.Label(logo_row, text="LABORA", font=("Segoe UI", 16, "bold"),
+        tk.Label(logo_row, text="LABORA", font=(_UI_FONT, 16, "bold"),
                  bg=WHITE, fg=ACCENT).pack(side="left")
-        tk.Label(logo_row, text=" · Barcode Scanner", font=("Segoe UI", 13),
+        tk.Label(logo_row, text=" · Barcode Scanner", font=(_UI_FONT, 13),
                  bg=WHITE, fg=GRAY_400).pack(side="left", pady=(2, 0))
 
         tk.Label(card, text="Select user", font=FONT_SM,
@@ -873,9 +892,9 @@ class ScannerApp(tk.Tk):
         # ── Top red bar ───────────────────────────────────────────────────────
         topbar = tk.Frame(self, bg=ACCENT, padx=16, pady=0)
         topbar.pack(fill="x")
-        tk.Label(topbar, text="LABORA", font=("Segoe UI", 11, "bold"),
+        tk.Label(topbar, text="LABORA", font=(_UI_FONT, 11, "bold"),
                  bg=ACCENT, fg=WHITE).pack(side="left", pady=8)
-        tk.Label(topbar, text=" · Barcode Scanner", font=("Segoe UI", 10),
+        tk.Label(topbar, text=" · Barcode Scanner", font=(_UI_FONT, 10),
                  bg=ACCENT, fg="#f0a0a0").pack(side="left", pady=8)
 
         # Show current commit hash in topbar
@@ -1575,9 +1594,9 @@ class ScannerApp(tk.Tk):
         # ── Top bar ───────────────────────────────────────────────────────────
         topbar = tk.Frame(self, bg=ACCENT, padx=16, pady=0)
         topbar.pack(fill="x")
-        tk.Label(topbar, text="LABORA", font=("Segoe UI", 11, "bold"),
+        tk.Label(topbar, text="LABORA", font=(_UI_FONT, 11, "bold"),
                  bg=ACCENT, fg=WHITE).pack(side="left", pady=8)
-        tk.Label(topbar, text=" · Restore from backup", font=("Segoe UI", 10),
+        tk.Label(topbar, text=" · Restore from backup", font=(_UI_FONT, 10),
                  bg=ACCENT, fg="#f0a0a0").pack(side="left", pady=8)
         ttk.Button(topbar, text="← Back", style="Ghost.TButton",
                    command=self._import_exit).pack(side="right", pady=4)
@@ -1844,7 +1863,7 @@ class ScannerApp(tk.Tk):
             tk.Frame(overlay, bg=ACCENT, height=4).pack(fill="x")
             inner = tk.Frame(overlay, bg=GRAY_800, padx=40, pady=40)
             inner.pack(expand=True)
-            tk.Label(inner, text="LABORA", font=("Segoe UI", 13, "bold"),
+            tk.Label(inner, text="LABORA", font=(_UI_FONT, 13, "bold"),
                      bg=GRAY_800, fg=ACCENT).pack()
             self._export_status_lbl = tk.Label(
                 inner, text=message, font=FONT, bg=GRAY_800, fg=GRAY_400)
