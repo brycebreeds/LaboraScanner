@@ -4,52 +4,62 @@
     {
       "id": "1378",
       "name": "Vess Final Assembly",
-      "token": "u89%2F6c2Ew%2Buxf8%2Fg0r6b3pjfraGnwb%2FYspqwqQ%3D%3D"
+      "token": "u89%2F6c2Ew%2Buxf8%2Fg0r6b3pjfraGnwb%2FYspqwqQ%3D%3D",
+      "allowShoeByShoeScanning": false
     },
     {
       "id": "1379",
       "name": "Vess Making",
-      "token": "u89%2F6c2Ew%2Buxf8%2Fg0r6b3pjfsaGnwb%2FYspqwqQ%3D%3D"
+      "token": "u89%2F6c2Ew%2Buxf8%2Fg0r6b3pjfsaGnwb%2FYspqwqQ%3D%3D",
+      "allowShoeByShoeScanning": false
     },
     {
       "id": "1380",
       "name": "Vess Finishing",
-      "token": "u89%2F6c2Ew%2Buxf8%2Fg0r6b3pmph6Gnwb%2FYspqwqQ%3D%3D"
+      "token": "u89%2F6c2Ew%2Buxf8%2Fg0r6b3pmph6Gnwb%2FYspqwqQ%3D%3D",
+      "allowShoeByShoeScanning": false
     },
     {
       "id": "1381",
       "name": "Petros Cutting",
-      "token": "u89%2F6c2Ew%2Buxf8%2Fg0r6b3pmpi6Gnwb%2FYspqwqQ%3D%3D"
+      "token": "u89%2F6c2Ew%2Buxf8%2Fg0r6b3pmpi6Gnwb%2FYspqwqQ%3D%3D",
+      "allowShoeByShoeScanning": false
     },
     {
       "id": "1382",
       "name": "Petros Uppers",
-      "token": "u89%2F6c2Ew%2Buxf8%2Fg0r6b3pmpj6Gnwb%2FYspqwqQ%3D%3D"
+      "token": "u89%2F6c2Ew%2Buxf8%2Fg0r6b3pmpj6Gnwb%2FYspqwqQ%3D%3D",
+      "allowShoeByShoeScanning": false
     },
     {
       "id": "1383",
       "name": "Jojo Final Assembly",
-      "token": "u89%2F6c2Ew%2Buxf8%2Fg0r6b3pmpk6Gnwb%2FYspqwqQ%3D%3D"
+      "token": "u89%2F6c2Ew%2Buxf8%2Fg0r6b3pmpk6Gnwb%2FYspqwqQ%3D%3D",
+      "allowShoeByShoeScanning": true
     },
     {
       "id": "1384",
       "name": "Jojo Making",
-      "token": "u89%2F6c2Ew%2Buxf8%2Fg0r6b3pmpl6Gnwb%2FYspqwqQ%3D%3D"
+      "token": "u89%2F6c2Ew%2Buxf8%2Fg0r6b3pmpl6Gnwb%2FYspqwqQ%3D%3D",
+      "allowShoeByShoeScanning": false
     },
     {
       "id": "1385",
       "name": "Jojo Finishing",
-      "token": "u89%2F6c2Ew%2Buxf8%2Fg0r6b3pmpm6Gnwb%2FYspqwqQ%3D%3D"
+      "token": "u89%2F6c2Ew%2Buxf8%2Fg0r6b3pmpm6Gnwb%2FYspqwqQ%3D%3D",
+      "allowShoeByShoeScanning": false
     },
     {
       "id": "1386",
       "name": "Desigan Uppers",
-      "token": "u89%2F6c2Ew%2Buxf8%2Fg0r6b3pmpn6Gnwb%2FYspqwqQ%3D%3D"
+      "token": "u89%2F6c2Ew%2Buxf8%2Fg0r6b3pmpn6Gnwb%2FYspqwqQ%3D%3D",
+      "allowShoeByShoeScanning": false
     },
     {
       "id": "1387",
       "name": "Desigan Bottoms",
-      "token": "u89%2F6c2Ew%2Buxf8%2Fg0r6b3pmpqaGnwb%2FYspqwqQ%3D%3D"
+      "token": "u89%2F6c2Ew%2Buxf8%2Fg0r6b3pmpqaGnwb%2FYspqwqQ%3D%3D",
+      "allowShoeByShoeScanning": false
     }
   ],
   "sftp": {

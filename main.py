@@ -16,12 +16,36 @@ from pathlib import Path
 
 from UniAPI import UniAPI
 
+# ── Connectivity debug patch ───────────────────────────────────────────────────
+# We wrap the two low-level transport methods so that when DEBUG_CONNECTIVITY is
+# True every API call fails exactly as it would during a real network outage.
+_real_do_post = UniAPI.do_post
+_real_do_get  = UniAPI.do_get
+
+def _debug_do_post(self, url, data, timeout=10):
+    if DEBUG_CONNECTIVITY:
+        log.debug(f"[DEBUG_CON] Blocked POST → {url}")
+        return '{"http_code": 666, "detail": "simulated connectivity loss"}'
+    return _real_do_post(self, url, data, timeout)
+
+def _debug_do_get(self, url, data, timeout=10):
+    if DEBUG_CONNECTIVITY:
+        log.debug(f"[DEBUG_CON] Blocked GET  → {url}")
+        return '{"http_code": 666, "detail": "simulated connectivity loss"}'
+    return _real_do_get(self, url, data, timeout)
+
+UniAPI.do_post = _debug_do_post
+UniAPI.do_get  = _debug_do_get
+
 # ── Files ─────────────────────────────────────────────────────────────────────
 SCRIPT_DIR    = Path(__file__).parent
 SETTINGS_FILE = SCRIPT_DIR / "settings.json"
 DATA_FILE     = SCRIPT_DIR / "scanner_data.json"
 RETRY_INTERVAL = 30    # seconds
 SYNC_INTERVAL  = 3600  # seconds — hourly SFTP sync
+
+# ── Debug flags ───────────────────────────────────────────────────────────────
+DEBUG_CONNECTIVITY = False   # toggled by scanning DEBUG_CON
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -67,10 +91,17 @@ FONT_SM     = ("Segoe UI", 9)
 FONT_XS     = ("Segoe UI", 8)
 
 # ── Barcode patterns ──────────────────────────────────────────────────────────
-BATCH_RE  = re.compile(r"^BAT_\d+$",          re.IGNORECASE)
-UPDATE_RE = re.compile(r"^UPD_[0-9a-f]{7,12}$", re.IGNORECASE)
-IMPORT_RE = re.compile(r"^IMPORT$",            re.IGNORECASE)
-SEL_RE    = re.compile(r"^SEL_(\d+)$",         re.IGNORECASE)
+BATCH_RE    = re.compile(r"^BAT_\d+$",          re.IGNORECASE)
+UPDATE_RE   = re.compile(r"^UPD_[0-9a-f]{7}$",  re.IGNORECASE)
+IMPORT_RE   = re.compile(r"^IMPORT$",            re.IGNORECASE)
+SEL_RE      = re.compile(r"^SEL_(\d+)$",         re.IGNORECASE)
+NUMERIC_RE  = re.compile(r"^\d+$")
+DEBUG_CON_RE = re.compile(r"^DEBUG_CON$",        re.IGNORECASE)
+
+# ── Shoe-by-shoe scanning constants ───────────────────────────────────────────
+SBSS_SETGROUP_ID  = "23"
+SBSS_BARCODE_PROP = "SuborderClientBarcodeshoeByShoe"
+SBSS_COUNT_PROP   = "SuborderCompletedShoeCount"
 
 
 # ── Settings ──────────────────────────────────────────────────────────────────
@@ -375,7 +406,7 @@ def export_session_snapshot(data, settings, progress_cb=None):
 USERS_ENTITY_ID    = "3"
 USERS_SET_NAME     = "Factory Line User - Org"
 USERS_SETGROUP     = "Factory Line User"
-USERS_PROPERTIES   = [["id", "view", "id"], "name", ["userForceLogin", "view", "token"]]
+USERS_PROPERTIES   = [["id", "view", "id"], "name", ["userForceLogin", "view", "token"], "allowShoeByShoeScanning"]
 USERS_DIRECTION    = "child"
 
 def fetch_users_from_api(api, settings):
@@ -414,7 +445,9 @@ def fetch_users_from_api(api, settings):
         if not uid or not name or not token:
             log.warning(f"Skipping incomplete user record from API: {u}")
             continue
-        users.append({"id": uid, "name": name, "token": token})
+        raw_sbss = u.get("allowShoeByShoeScanning", "")
+        allow_sbss = str(raw_sbss).strip().lower() in ("1", "true", "yes")
+        users.append({"id": uid, "name": name, "token": token, "allowShoeByShoeScanning": allow_sbss})
 
     if not users:
         log.warning("fetch_users_from_api — no valid users parsed from API response")
@@ -489,6 +522,7 @@ class ScannerApp(tk.Tk):
         self.configure(bg=BG)
         self.resizable(True, True)
         self.minsize(700, 520)
+        self.after(0, lambda: self.state("zoomed"))
 
         self.settings          = None
         self.data              = load_data()
@@ -499,10 +533,16 @@ class ScannerApp(tk.Tk):
         self._pending_user_switch = None   # user dict awaiting confirm barcode
 
         self._import_buffer = ""   # accumulates keystrokes for global IMPORT catch
+        self._debug_banner  = None # connectivity debug mode banner widget
+        self._net_icon      = None # topbar connectivity icon label
+        self._net_pill      = None # coloured frame around the icon
+        self._net_online    = None # True / False / None (unknown)
+        self._topbar        = None # topbar frame ref for bg flash
         self._style()
         self._boot()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._start_retry_loop()
+        self._start_connectivity_poll()
         self.bind_all("<Key>", self._global_import_intercept)
 
     # ── Boot ──────────────────────────────────────────────────────────────────
@@ -801,6 +841,19 @@ class ScannerApp(tk.Tk):
 
         right_top = tk.Frame(topbar, bg=ACCENT)
         right_top.pack(side="right")
+
+        # Connectivity pill — updated by the background poll loop.
+        # _net_pill_frame holds a coloured bg; _net_icon is the label inside it.
+        net_text, pill_bg, pill_fg = self._net_icon_state()
+        self._net_pill = tk.Frame(right_top, bg=pill_bg, padx=8, pady=2)
+        self._net_pill.pack(side="left", padx=(0, 10), pady=6)
+        self._net_icon = tk.Label(self._net_pill, text=net_text,
+                                  font=FONT_BOLD, bg=pill_bg, fg=pill_fg)
+        self._net_icon.pack()
+
+        # Keep a ref to topbar so we can flash its bg when offline
+        self._topbar = topbar
+
         tk.Label(right_top, text=user_name, font=FONT_SM,
                  bg=ACCENT, fg="#fcdede").pack(side="left", padx=(0, 8), pady=8)
         ttk.Button(right_top, text="Sign out", style="Ghost.TButton",
@@ -879,6 +932,10 @@ class ScannerApp(tk.Tk):
         self._tree.tag_configure("update",  foreground=ACCENT)
 
         self._load_log()
+
+        # Re-inject the debug banner if connectivity simulation is still active
+        if DEBUG_CONNECTIVITY:
+            self._show_debug_banner()
 
     # ── Log helpers ───────────────────────────────────────────────────────────
     RESULT_ICONS = {
@@ -961,7 +1018,9 @@ class ScannerApp(tk.Tk):
         self._scan_var.set("")
         self._scan_entry.focus()
 
-        if raw.upper() == "IMPORT":
+        if DEBUG_CON_RE.match(raw):
+            self._toggle_debug_connectivity()
+        elif raw.upper() == "IMPORT":
             self._open_import_screen()
         elif self.UPDATE_RE.match(raw):
             self._handle_update_barcode(raw)
@@ -975,6 +1034,8 @@ class ScannerApp(tk.Tk):
             self._handle_import_select(raw)
         elif self.BARCODE_RE.match(raw):
             self._handle_batch_barcode(raw)
+        elif NUMERIC_RE.match(raw) and self._user_allows_sbss():
+            self._handle_sbss_barcode(raw)
         else:
             log.warning(f"Unrecognised barcode rejected: '{raw}'")
             self._scan_msg.config(
@@ -1165,6 +1226,142 @@ class ScannerApp(tk.Tk):
         self.after(0, self._refresh_pending_label)
         self.after(0, lambda m=msg, c=col: self._scan_msg.config(text=m, fg=c))
 
+    # ── Shoe-by-shoe scanning ────────────────────────────────────────────────
+    def _user_allows_sbss(self):
+        """Return True if the currently logged-in user has allowShoeByShoeScanning set."""
+        user_name = (self.data.get("session") or {}).get("user_name", "")
+        user = next((u for u in self.settings.get("users", []) if u["name"] == user_name), {})
+        return bool(user.get("allowShoeByShoeScanning"))
+
+    def _handle_sbss_barcode(self, raw):
+        log.info(f"Shoe-by-shoe barcode scanned: '{raw}'")
+        self._scan_msg.config(text=f"Looking up {raw}…", fg=TEXT_DIM)
+        threading.Thread(target=self._process_sbss_scan, args=(raw,), daemon=True).start()
+
+    def _process_sbss_scan(self, barcode):
+        now = datetime.now()
+        scan = {
+            "id":        f"{now.strftime('%Y%m%d%H%M%S%f')}-SBSS-{barcode}",
+            "type":      "sbss",
+            "date":      now.strftime("%Y-%m-%d"),
+            "time":      now.strftime("%H:%M:%S"),
+            "user_name": (self.data.get("session") or {}).get("user_name", ""),
+            "batch_id":  barcode,
+            "entity_id": "",
+            "shoe":      "shoe-by-shoe",
+            "size":      "",
+            "qty":       "",
+            "result":    "pending",
+            "attempts":  0,
+        }
+        self.data.setdefault("scans", []).append(scan)
+        save_data(self.data)
+        self.after(0, lambda s=scan: self._insert_row(s, prepend=True))
+        self.after(0, self._refresh_pending_label)
+        self._do_sbss_attempt(scan)
+
+    def _do_sbss_attempt(self, scan):
+        """Resolve entity list and increment the first entity with room. Safe to call on retry."""
+        barcode = scan["batch_id"]
+        scan["attempts"] = scan.get("attempts", 0) + 1
+        log.debug(f"SBSS: attempt {scan['attempts']} for barcode='{barcode}'")
+
+        # Step 1 — resolve entity ID(s)
+        response = self.api.get_entity_id_from_unique_property_value(
+            SBSS_SETGROUP_ID, SBSS_BARCODE_PROP, barcode)
+        log.debug(f"SBSS: get_entity_id response={response}")
+
+        if not response:
+            log.warning(f"SBSS: lookup failed for '{barcode}' — will retry")
+            scan["result"] = "pending"
+            self._persist_scan(scan)
+            self.after(0, lambda s=scan: self._update_row(s))
+            self.after(0, self._refresh_pending_label)
+            self.after(0, lambda: self._scan_msg.config(
+                text=f"⟳ {barcode} — lookup failed, will retry", fg=WARNING))
+            return
+
+        if isinstance(response, dict) and "list" in response:
+            entity_ids = [str(e).strip() for e in response["list"] if str(e).strip()]
+        elif isinstance(response, dict):
+            eid = str(response.get("id") or response.get("entityID") or "").strip()
+            entity_ids = [eid] if eid else []
+        else:
+            entity_ids = [str(response).strip()]
+        entity_ids = [e for e in entity_ids if e]
+
+        if not entity_ids:
+            log.error(f"SBSS: could not resolve any entity_id for barcode '{barcode}'")
+            scan["result"] = "fail"
+            self._persist_scan(scan)
+            self.after(0, lambda s=scan: self._update_row(s))
+            self.after(0, self._refresh_pending_label)
+            self.after(0, lambda: self._scan_msg.config(
+                text=f"Could not resolve entity for: {barcode}", fg=DANGER))
+            return
+
+        log.info(f"SBSS: resolved entity_ids={entity_ids}")
+
+        # Step 2 — walk entities; increment the first one with room
+        for entity_id in entity_ids:
+            props = self.api.get_entity_property(
+                entity_id, [[SBSS_COUNT_PROP, "view"], ["OrderLineQty", "view"]])
+            log.debug(f"SBSS: props for entity={entity_id}: {props}")
+
+            if props is False or props is None:
+                log.warning(f"SBSS: could not fetch props for entity={entity_id}, skipping")
+                continue
+
+            try:
+                current_count = int(props.get(SBSS_COUNT_PROP) or 0)
+            except (ValueError, TypeError):
+                current_count = 0
+            try:
+                line_qty = int(props.get("OrderLineQty") or 0)
+            except (ValueError, TypeError):
+                line_qty = 0
+
+            log.info(f"SBSS: entity={entity_id}  count={current_count}  qty={line_qty}")
+
+            if line_qty > 0 and current_count >= line_qty:
+                log.info(f"SBSS: entity={entity_id} full ({current_count}/{line_qty}), moving on")
+                continue
+
+            # This entity has room — increment
+            new_count = current_count + 1
+            result = self.api.update_entity_property(
+                entity_id, {SBSS_COUNT_PROP: str(new_count)})
+            log.debug(f"SBSS: update_entity_property response={result}")
+
+            if result is not None:
+                scan["result"]    = "ok"
+                scan["entity_id"] = entity_id
+                scan["qty"]       = f"{new_count}/{line_qty}"
+                self._persist_scan(scan)
+                self.after(0, lambda s=scan: self._update_row(s))
+                self.after(0, self._refresh_pending_label)
+                self.after(0, lambda b=barcode, n=new_count, q=line_qty: self._scan_msg.config(
+                    text=f"✓ {b} — {n}/{q}", fg=SUCCESS))
+                log.info(f"SBSS: update succeeded — entity={entity_id}  {new_count}/{line_qty}")
+            else:
+                scan["result"] = "pending"
+                self._persist_scan(scan)
+                self.after(0, lambda s=scan: self._update_row(s))
+                self.after(0, self._refresh_pending_label)
+                self.after(0, lambda b=barcode: self._scan_msg.config(
+                    text=f"⟳ {b} — update failed, will retry", fg=WARNING))
+                log.warning(f"SBSS: update failed — entity={entity_id}  will retry in {RETRY_INTERVAL}s")
+            return
+
+        # All entities full — nothing left to do, mark done
+        scan["result"] = "ok"
+        self._persist_scan(scan)
+        self.after(0, lambda s=scan: self._update_row(s))
+        self.after(0, self._refresh_pending_label)
+        log.warning(f"SBSS: all entities full for barcode '{barcode}'")
+        self.after(0, lambda b=barcode: self._scan_msg.config(
+            text=f"All orders full for barcode: {b}", fg=WARNING))
+
     def _persist_scan(self, updated):
         for i, s in enumerate(self.data.get("scans", [])):
             if s["id"] == updated["id"]:
@@ -1185,7 +1382,10 @@ class ScannerApp(tk.Tk):
                 if pending:
                     log.info(f"Retry loop — retrying {len(pending)} pending scan(s)")
                     for scan in pending:
-                        self._push_scan(scan)
+                        if scan.get("type") == "sbss":
+                            self._do_sbss_attempt(scan)
+                        else:
+                            self._push_scan(scan)
                 else:
                     log.debug("Retry loop — no pending scans")
 
@@ -1619,6 +1819,132 @@ class ScannerApp(tk.Tk):
                 pass
             self._export_overlay = None
 
+    # ── Connectivity indicator ─────────────────────────────────────────────────
+    NET_POLL_INTERVAL = 10   # seconds between liveness checks
+
+    def _net_icon_state(self):
+        """Return (text, pill_bg, pill_fg) for the current connectivity state."""
+        if DEBUG_CONNECTIVITY:
+            return "⚠ NO CONNECTION (debug)", WARNING, WHITE
+        if self._net_online is True:
+            return "● online", SUCCESS, WHITE
+        if self._net_online is False:
+            return "⚠ NO CONNECTION", DANGER, WHITE
+        return "● …", GRAY_600, WHITE
+
+    def _refresh_net_icon(self):
+        """Push current state into the pill and topbar background (main-thread only)."""
+        if not self._net_icon or not self._net_pill:
+            return
+        try:
+            text, pill_bg, pill_fg = self._net_icon_state()
+            self._net_pill.config(bg=pill_bg)
+            self._net_icon.config(text=text, bg=pill_bg, fg=pill_fg)
+            # Flash the entire topbar amber when offline so it's unmissable
+            offline = (self._net_online is False) or DEBUG_CONNECTIVITY
+            bar_bg  = WARNING if offline else ACCENT
+            if self._topbar:
+                self._topbar.config(bg=bar_bg)
+                for child in self._topbar.winfo_children():
+                    try:
+                        child.config(bg=bar_bg)
+                        for gc in child.winfo_children():
+                            try:
+                                # Don't recolour the pill itself
+                                if gc is not self._net_pill and gc is not self._net_icon:
+                                    gc.config(bg=bar_bg)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    def _start_connectivity_poll(self):
+        """Spawn a daemon thread that pings the baseurl every NET_POLL_INTERVAL seconds."""
+        def poll():
+            while self.running:
+                self._check_connectivity()
+                time.sleep(self.NET_POLL_INTERVAL)
+        threading.Thread(target=poll, daemon=True).start()
+
+    def _check_connectivity(self):
+        """Probe baseurl with a short GET; update _net_online and the icon."""
+        if DEBUG_CONNECTIVITY:
+            online = False
+        else:
+            try:
+                import requests as _req
+                baseurl = (self.settings or {}).get("baseurl", "")
+                if not baseurl:
+                    online = False
+                else:
+                    r = _req.get(baseurl, timeout=5)
+                    online = r.status_code < 500
+            except Exception:
+                online = False
+
+        changed = (online != self._net_online)
+        self._net_online = online
+        if changed or True:   # always refresh so icon appears on first paint
+            self.after(0, self._refresh_net_icon)
+
+    # ── Connectivity debug mode ────────────────────────────────────────────────
+    def _toggle_debug_connectivity(self):
+        global DEBUG_CONNECTIVITY
+        DEBUG_CONNECTIVITY = not DEBUG_CONNECTIVITY
+        state = "ENABLED" if DEBUG_CONNECTIVITY else "DISABLED"
+        log.warning(f"[DEBUG_CON] Connectivity simulation {state}")
+
+        # Immediately re-probe (or simulate) so the icon reflects the new state
+        threading.Thread(target=self._check_connectivity, daemon=True).start()
+
+        if DEBUG_CONNECTIVITY:
+            self._show_debug_banner()
+            self._scan_msg.config(
+                text="⚠ Connectivity debug ON — all API calls are now failing",
+                fg=WARNING)
+        else:
+            self._hide_debug_banner()
+            self._scan_msg.config(
+                text="✓ Connectivity debug OFF — normal operation resumed",
+                fg=SUCCESS)
+
+    def _show_debug_banner(self):
+        """Inject a persistent warning banner just below the topbar."""
+        if getattr(self, "_debug_banner", None):
+            return  # already visible
+        # Place the banner as the second widget (after the topbar)
+        banner = tk.Frame(self, bg=WARNING, padx=16, pady=6)
+        tk.Label(
+            banner,
+            text="⚠  CONNECTIVITY DEBUG MODE ACTIVE — all API calls are being blocked  ⚠",
+            font=FONT_BOLD,
+            bg=WARNING,
+            fg=WHITE,
+        ).pack(side="left")
+        tk.Label(
+            banner,
+            text="Scan DEBUG_CON to disable",
+            font=FONT_SM,
+            bg=WARNING,
+            fg="#fff8e1",
+        ).pack(side="right")
+
+        # Insert after the topbar (index 1 in the pack order)
+        children = self.winfo_children()
+        topbar   = children[0] if children else None
+        banner.pack(fill="x", after=topbar) if topbar else banner.pack(fill="x")
+        self._debug_banner = banner
+
+    def _hide_debug_banner(self):
+        if getattr(self, "_debug_banner", None):
+            try:
+                self._debug_banner.destroy()
+            except Exception:
+                pass
+            self._debug_banner = None
+
     # ── Sign out ───────────────────────────────────────────────────────────────
     def _sign_out(self):
         user_name = (self.data.get("session") or {}).get("user_name", "user")
@@ -1716,6 +2042,13 @@ class ScannerApp(tk.Tk):
         self.unbind_all("<Key>")
         for w in self.winfo_children():
             w.destroy()
+        # Banner widget was destroyed above; reset the reference.
+        # _show_main will re-inject it if the mode is still active.
+        self._debug_banner = None
+        # Net icon widget is gone; the poll loop checks for None before updating.
+        self._net_icon = None
+        self._net_pill = None
+        self._topbar   = None
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
