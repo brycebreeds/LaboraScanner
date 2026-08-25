@@ -1176,9 +1176,11 @@ class ScannerApp(tk.Tk):
     def _handle_batch_barcode(self, raw):
         normalised = raw.upper()
 
+        current_user = (self.data.get("session") or {}).get("user_name", "")
         already = next(
             (s for s in self.data.get("scans", [])
-             if s.get("batch_id", "").upper() == normalised),
+             if s.get("batch_id", "").upper() == normalised
+             and s.get("user_name") == current_user),
             None
         )
         if already:
@@ -1265,14 +1267,38 @@ class ScannerApp(tk.Tk):
 
     def _push_scan(self, scan):
         scan["attempts"] = scan.get("attempts", 0) + 1
-        api_value = scan.get("status_value") or scan.get("status_label")
+        print(scan)
+        api_value  = scan.get("status_value") or scan.get("status_label")
+        phase_str  = str(scan.get("status_value") or "").strip()
+
+        props = {}
+        if phase_str in ("299", "301"):
+            props["BatchUppersProductionPhase"] = api_value
+            if phase_str == "299":
+                props["UnitProductionPhase"] =  "303"
+            if phase_str == "301":
+                props["UnitProductionPhase"] =  "304"
+        elif phase_str in ("302", "300"):
+            props["BatchBottomsProductionPhase"] =  api_value
+            if phase_str == "300":
+                props["UnitProductionPhase"] =  "303"
+            if phase_str == "302":
+                props["UnitProductionPhase"] =  "304"
+        else:
+            props["UnitProductionPhase"] =  api_value
+
+        if phase_str == "95":
+            props["BatchUppersProductionPhase"] = ""
+            props["BatchBottomsProductionPhase"] = ""
+            props["UnitProductionPhase"] =  "95"
+
         log.debug(
             f"Pushing update — entity={scan['entity_id']}  "
-            f"phase_value={api_value}  attempt={scan['attempts']}"
+            f"phase_value={api_value}  prop={props}  attempt={scan['attempts']}"
         )
         result = self.api.update_entity_property(
             scan["entity_id"],
-            {"UnitProductionPhase": api_value}
+            props
         )
         log.debug(f"update_entity_property response: {result}")
 
