@@ -145,6 +145,9 @@ SBSS_SETGROUP_ID  = "23"
 SBSS_BARCODE_PROP = "SuborderClientBarcodeshoeByShoe"
 SBSS_COUNT_PROP   = "SuborderCompletedShoeCount"
 
+FINISHING_PHASE        = "97"    # UnitProductionPhase value meaning Finishing
+BATCH_COMPLETE_PHASE   = "307"   # UnitProductionPhase value meaning Batch Complete
+
 
 # ── Secrets (user-owned, read-only) ───────────────────────────────────────────
 _WRITE_LOCK = threading.Lock()   # serialises atomic JSON writes across threads
@@ -1176,10 +1179,12 @@ class ScannerApp(tk.Tk):
     def _handle_update_barcode(self, raw):
         normalised = raw.upper()
 
-        # Duplicate check against stored updates
+        # Duplicate check against stored updates — only a successful (ok)
+        # update blocks re-scanning; failed/pending attempts may be retried.
         already = next(
             (u for u in self.data.get("updates", [])
-             if u.get("barcode", "").upper() == normalised),
+             if u.get("barcode", "").upper() == normalised
+             and u.get("result") == "ok"),
             None
         )
         if already:
@@ -1566,6 +1571,7 @@ class ScannerApp(tk.Tk):
                 self.after(0, lambda b=barcode, n=new_count, q=line_qty: self._scan_msg.config(
                     text=f"✓ {b} — {n}/{q}", fg=SUCCESS))
                 log.info(f"SBSS: update succeeded — entity={entity_id}  {new_count}/{line_qty}")
+                self._complete_finishing_batches(entity_id)
             else:
                 scan["result"] = "pending"
                 self._persist_scan(scan)
@@ -1591,6 +1597,31 @@ class ScannerApp(tk.Tk):
                 self.data["scans"][i] = updated
                 break
         save_data(self.data)
+
+    def _complete_finishing_batches(self, sub_order_id):
+        """Best-effort: move any related Batch still in Finishing phase to
+        Batch Complete (307). Never raises and never affects the scan result."""
+        try:
+            batches = self._normalise_related(
+                self.api.get_related_entity_data(
+                    sub_order_id, "Batch", "Sub-Order",
+                    [["id", "view", "id"], ["UnitProductionPhase", "view"]],
+                    "child"))
+            if not batches:
+                log.warning(f"No Batch entities found for Sub-Order={sub_order_id} — skipping phase completion")
+                return
+            for batch in batches:
+                phase = str(batch.get("UnitProductionPhase") or "").strip()
+                if phase != FINISHING_PHASE:
+                    continue
+                result = self.api.update_entity_property(
+                    batch["id"], {"UnitProductionPhase": BATCH_COMPLETE_PHASE})
+                if result is not None:
+                    log.info(f"Batch={batch['id']} moved from Finishing to Batch Complete ({BATCH_COMPLETE_PHASE})")
+                else:
+                    log.warning(f"Batch={batch['id']} phase completion update failed")
+        except Exception as e:
+            log.warning(f"Batch phase completion failed for Sub-Order={sub_order_id}: {e}")
 
     # ── Retry loop ────────────────────────────────────────────────────────────
     def _start_retry_loop(self):
