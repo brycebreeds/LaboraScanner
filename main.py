@@ -71,7 +71,8 @@ if _labora_root:
 else:
     SCRIPT_DIR = Path(__file__).parent
 
-SETTINGS_FILE  = SCRIPT_DIR / "settings.json"
+SETTINGS_FILE  = SCRIPT_DIR / "settings.json"   # app-owned runtime config (instance_id, users) — untracked
+SECRETS_FILE   = SCRIPT_DIR / "secrets.json"    # user-maintained site config (baseurl, sftp) — read-only
 DATA_FILE      = SCRIPT_DIR / "scanner_data.json"
 RETRY_INTERVAL = 30    # seconds
 SYNC_INTERVAL  = 3600  # seconds — hourly SFTP sync
@@ -135,11 +136,8 @@ FONT_SM     = (_UI_FONT, 9)
 FONT_XS     = (_UI_FONT, 8)
 
 # ── Barcode patterns ──────────────────────────────────────────────────────────
-BATCH_RE    = re.compile(r"^BAT_\d+$",          re.IGNORECASE)
-UPDATE_RE   = re.compile(r"^UPD_[0-9a-f]{7}$",  re.IGNORECASE)
-IMPORT_RE   = re.compile(r"^IMPORT$",            re.IGNORECASE)
-SEL_RE      = re.compile(r"^SEL_(\d+)$",         re.IGNORECASE)
-NUMERIC_RE  = re.compile(r"^\d+$")
+# Batch/update/select regexes are declared on ScannerApp (see _submit_scan).
+NUMERIC_RE   = re.compile(r"^\d+$")
 DEBUG_CON_RE = re.compile(r"^DEBUG_CON$",        re.IGNORECASE)
 
 # ── Shoe-by-shoe scanning constants ───────────────────────────────────────────
@@ -148,20 +146,58 @@ SBSS_BARCODE_PROP = "SuborderClientBarcodeshoeByShoe"
 SBSS_COUNT_PROP   = "SuborderCompletedShoeCount"
 
 
+# ── Secrets (user-owned, read-only) ───────────────────────────────────────────
+_WRITE_LOCK = threading.Lock()   # serialises atomic JSON writes across threads
+
+def _atomic_write_json(path, data):
+    """Write JSON atomically: temp file in the same dir, then os.replace."""
+    with _WRITE_LOCK:
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
+    log.debug(f"Atomic write: {path.name}")
+
+def load_secrets():
+    """Read secrets.json (user-maintained site config: baseurl, sftp)."""
+    try:
+        if SECRETS_FILE.exists():
+            d = json.loads(SECRETS_FILE.read_text(encoding="utf-8"))
+            if isinstance(d, dict):
+                return d
+            log.warning("secrets.json invalid — ignoring it")
+    except Exception as e:
+        log.error(f"Could not read secrets.json: {e}")
+    return {}
+
+
 # ── Settings ──────────────────────────────────────────────────────────────────
 def load_settings():
+    """
+    Build the merged runtime settings dict:
+      - secrets.json  (user-maintained, read-only): baseurl, sftp
+      - settings.json (app-owned, read/write):      instance_id, users
+    """
     log.debug(f"Loading settings from: {SETTINGS_FILE}")
     if not SETTINGS_FILE.exists():
         log.error("settings.json not found")
         return None, "settings.json not found next to the script."
     try:
-        s = json.loads(SETTINGS_FILE.read_text())
+        s = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
     except json.JSONDecodeError as e:
         log.error(f"settings.json JSON error: {e}")
         return None, f"settings.json is invalid JSON:\n{e}"
-    if not s.get("baseurl"):
-        log.error("settings.json missing 'baseurl'")
-        return None, 'settings.json is missing "baseurl".'
+
+    secrets = load_secrets()
+    baseurl = secrets.get("baseurl")
+    if not baseurl:
+        log.error("secrets.json missing 'baseurl'")
+        return None, 'secrets.json is missing "baseurl".'
+
+    s["baseurl"] = secrets["baseurl"]
+    sftp = secrets.get("sftp")
+    if isinstance(sftp, dict) and sftp.get("host"):
+        s["sftp"] = sftp
+
     if "users" not in s:
         s["users"] = []   # will be populated by fetch_users_from_api
     if not isinstance(s["users"], list):
@@ -170,13 +206,18 @@ def load_settings():
     for u in s["users"]:
         if not u.get("name") or not u.get("token"):
             log.warning(f"User entry missing name or token (will be refreshed from API): {u}")
+
+    # settings.json is app-owned runtime config (not tracked in git). Seed a
+    # per-machine instance_id into it on first run.
+    changed = False
     if not s.get("instance_id"):
         s["instance_id"] = uuid.uuid4().hex[:12]
-        try:
-            SETTINGS_FILE.write_text(json.dumps(s, indent=2))
-            log.info(f"Generated new instance_id: {s['instance_id']}")
-        except Exception as e:
-            log.warning(f"Could not persist instance_id: {e}")
+        changed = True
+
+    if changed:
+        save_settings(s)
+        log.info(f"Generated new instance_id: {s['instance_id']}")
+
     log.info(f"Settings loaded — baseurl={s['baseurl']}  instance_id={s['instance_id']}  users={[u['name'] for u in s['users']]}")
     return s, None
 
@@ -194,8 +235,22 @@ def load_data():
 
 
 def save_data(data):
-    DATA_FILE.write_text(json.dumps(data, indent=2))
+    _atomic_write_json(DATA_FILE, data)
     log.debug("scanner_data.json saved")
+
+
+def save_settings(settings):
+    """Persist only the app-owned keys to settings.json.
+
+    baseurl/sftp live in user-maintained secrets.json and must never be
+    written back into settings.json.
+    """
+    payload = {
+        "instance_id": settings.get("instance_id"),
+        "users":       settings.get("users", []),
+    }
+    _atomic_write_json(SETTINGS_FILE, payload)
+    log.debug("settings.json saved")
 
 
 
@@ -499,11 +554,10 @@ def fetch_users_from_api(api, settings):
 
     settings["users"] = users
     try:
-        SETTINGS_FILE.write_text(json.dumps(settings, indent=2))
+        save_settings(settings)
         log.info(f"settings.json updated — {len(users)} user(s): {[u['name'] for u in users]}")
     except Exception as e:
         log.error(f"Could not write settings.json: {e}")
-
     return True
 
 
@@ -539,10 +593,13 @@ def git_checkout_and_pull(commit_hash):
         if fetch.returncode != 0:
             return False, f"git fetch failed: {fetch.stderr.strip()}"
 
-        # Exclude runtime files from checkout — these belong to the site,
-        # not the repo, and must never be overwritten by an update.
-        runtime_files = ["scanner_data.json", "settings.json", "launcher.log",
-                         ".deps_installed"]
+        # Local/runtime files are excluded from checkout — they belong to the
+        # site, not the repo, and must never be overwritten by an update.
+        # settings.json and secrets.json are both untracked runtime config;
+        # older commits may still have settings.json in their tree, so the
+        # skip-worktree flag keeps a rollback from clobbering the local config.
+        runtime_files = ["scanner_data.json", "settings.json", "secrets.json",
+                         "launcher.log", ".deps_installed"]
         for f in runtime_files:
             skip = subprocess.run(
                 [_GIT_EXE] + _GIT_SAFE + ["update-index", "--skip-worktree", f],
@@ -700,8 +757,8 @@ class ScannerApp(tk.Tk):
                  bg=WHITE, fg=DANGER).pack(anchor="w", pady=(0, 8))
         tk.Label(f, text=msg, font=FONT_SM, bg=WHITE, fg=TEXT_DIM,
                  wraplength=400, justify="left").pack(anchor="w", pady=(0, 12))
-        tk.Label(f, text=f"Expected: {SETTINGS_FILE}",
-                 font=FONT_XS, bg=WHITE, fg=TEXT_MUTED).pack(anchor="w")
+        tk.Label(f, text=f"Expected: {SETTINGS_FILE}\nsecrets:  {SECRETS_FILE}",
+                 font=FONT_XS, bg=WHITE, fg=TEXT_MUTED, justify="left").pack(anchor="w")
 
     # ── Login view ────────────────────────────────────────────────────────────
     def _show_login(self):
@@ -792,26 +849,31 @@ class ScannerApp(tk.Tk):
         self.update()
 
         def attempt():
-            api = UniAPI(self.settings["baseurl"], token=user["token"])
-            log.debug(f"Calling flogin for '{name}' — baseurl={self.settings['baseurl']}")
-            detail = api.flogin(user["token"])
-            if detail:
-                log.info(f"flogin succeeded — entityID={api.entityID}  token={api.token[:12]}…")
-                self.api = api
-                fetch_users_from_api(api, self.settings)
-                props = api.get_entity_property(api.entityID, [
-                    "PhaseToEnter",
-                    ["PhaseToEnter", "view", "PhaseToEnterName"]
-                ])
-                log.debug(f"get_entity_property response: {props}")
-                status       = (props or {}).get("PhaseToEnter")
-                status_label = (props or {}).get("PhaseToEnterName") or status
-                log.info(f"User PhaseToEnter = '{status}'  label = '{status_label}'")
-                self.after(0, lambda: self._on_login_success(name, detail, status, status_label))
-            else:
-                log.error(f"flogin failed for user '{name}'")
+            try:
+                api = UniAPI(self.settings["baseurl"], token=user["token"])
+                log.debug(f"Calling flogin for '{name}' — baseurl={self.settings['baseurl']}")
+                detail = api.flogin(user["token"])
+                if detail:
+                    log.info(f"flogin succeeded — entityID={api.entityID}  token={api.token[:12]}…")
+                    self.api = api
+                    fetch_users_from_api(api, self.settings)
+                    props = api.get_entity_property(api.entityID, [
+                        "PhaseToEnter",
+                        ["PhaseToEnter", "view", "PhaseToEnterName"]
+                    ])
+                    log.debug(f"get_entity_property response: {props}")
+                    status       = (props or {}).get("PhaseToEnter")
+                    status_label = (props or {}).get("PhaseToEnterName") or status
+                    log.info(f"User PhaseToEnter = '{status}'  label = '{status_label}'")
+                    self.after(0, lambda: self._on_login_success(name, detail, status, status_label))
+                else:
+                    log.error(f"flogin failed for user '{name}'")
+                    self.after(0, lambda: self._login_err.config(
+                        text="Login failed. Check the token in settings.json.", fg=DANGER))
+            except Exception as e:
+                log.error(f"Login thread crashed for '{name}': {e}")
                 self.after(0, lambda: self._login_err.config(
-                    text="Login failed. Check the token in settings.json.", fg=DANGER))
+                    text=f"Login error: {e}", fg=DANGER))
 
         threading.Thread(target=attempt, daemon=True).start()
 
@@ -846,34 +908,38 @@ class ScannerApp(tk.Tk):
             token = user["token"] if user else sess.get("token", "")
             log.info(f"Restoring session for '{user_name}' — using token from settings.json")
 
-            api = UniAPI(self.settings["baseurl"], token=token)
-            detail = api.flogin(token)
-            if detail:
-                log.info(f"Session restored — entityID={api.entityID}")
-                self.api = api
-                fetch_users_from_api(api, self.settings)
-                props = api.get_entity_property(api.entityID, [
-                    "PhaseToEnter",
-                    ["PhaseToEnter", "view", "PhaseToEnterName"]
-                ])
-                log.debug(f"get_entity_property response: {props}")
-                status       = (props or {}).get("PhaseToEnter")
-                status_label = (props or {}).get("PhaseToEnterName") or status
-                log.info(f"PhaseToEnter = '{status}'  label = '{status_label}'")
-                self.user_status       = status
-                self.user_status_label = status_label
-                self.data["session"].update({
-                    "token":        api.token,
-                    "entity_id":    api.entityID,
-                    "status":       status,
-                    "status_label": status_label,
-                })
-                save_data(self.data)
-                self.after(0, self._show_main)
-            else:
-                log.warning("Session restore failed — returning to login")
-                self.data["session"] = None
-                save_data(self.data)
+            try:
+                api = UniAPI(self.settings["baseurl"], token=token)
+                detail = api.flogin(token)
+                if detail:
+                    log.info(f"Session restored — entityID={api.entityID}")
+                    self.api = api
+                    fetch_users_from_api(api, self.settings)
+                    props = api.get_entity_property(api.entityID, [
+                        "PhaseToEnter",
+                        ["PhaseToEnter", "view", "PhaseToEnterName"]
+                    ])
+                    log.debug(f"get_entity_property response: {props}")
+                    status       = (props or {}).get("PhaseToEnter")
+                    status_label = (props or {}).get("PhaseToEnterName") or status
+                    log.info(f"PhaseToEnter = '{status}'  label = '{status_label}'")
+                    self.user_status       = status
+                    self.user_status_label = status_label
+                    self.data["session"].update({
+                        "token":        api.token,
+                        "entity_id":    api.entityID,
+                        "status":       status,
+                        "status_label": status_label,
+                    })
+                    save_data(self.data)
+                    self.after(0, self._show_main)
+                else:
+                    log.warning("Session restore failed — returning to login")
+                    self.data["session"] = None
+                    save_data(self.data)
+                    self.after(0, self._show_login)
+            except Exception as e:
+                log.error(f"Session restore thread crashed for '{user_name}': {e}")
                 self.after(0, self._show_login)
 
         threading.Thread(target=attempt, daemon=True).start()
@@ -1095,7 +1161,8 @@ class ScannerApp(tk.Tk):
         elif self.CANCEL_RE.match(raw):
             self._handle_user_cancel()
         elif self.SEL_RE.match(raw):
-            self._handle_import_select(raw)
+            m = self.SEL_RE.match(raw)
+            self._import_select(int(m.group(1)))
         elif self.BARCODE_RE.match(raw):
             self._handle_batch_barcode(raw)
         elif NUMERIC_RE.match(raw) and self._user_allows_sbss():
@@ -1226,6 +1293,18 @@ class ScannerApp(tk.Tk):
         threading.Thread(target=self._process_scan, args=(scan,), daemon=True).start()
 
     def _process_scan(self, scan):
+        try:
+            self._process_scan_impl(scan)
+        except Exception as e:
+            log.error(f"Scan worker crashed for entity={scan.get('entity_id')}: {e}")
+            scan["result"] = "pending"
+            self._persist_scan(scan)
+            self.after(0, lambda s=scan: self._update_row(s))
+            self.after(0, self._refresh_pending_label)
+            self.after(0, lambda: self._scan_msg.config(
+                text=f"Scan error, will retry: {scan.get('batch_id')}", fg=DANGER))
+
+    def _process_scan_impl(self, scan):
         entity_id = scan["entity_id"]
 
         log.debug(f"Verifying entity exists: entity_id={entity_id}")
@@ -1267,7 +1346,6 @@ class ScannerApp(tk.Tk):
 
     def _push_scan(self, scan):
         scan["attempts"] = scan.get("attempts", 0) + 1
-        print(scan)
         api_value  = scan.get("status_value") or scan.get("status_label")
         phase_str  = str(scan.get("status_value") or "").strip()
 
@@ -1292,32 +1370,12 @@ class ScannerApp(tk.Tk):
             props["BatchBottomsProductionPhase"] = ""
             props["UnitProductionPhase"] =  "95"
 
-        log.debug(
-            f"Pushing update — entity={scan['entity_id']}  "
-            f"phase_value={api_value}  prop={props}  attempt={scan['attempts']}"
-        )
-        result = self.api.update_entity_property(
-            scan["entity_id"],
-            props
-        )
-        log.debug(f"update_entity_property response: {result}")
-
-        sub_order = self.api.get_related_entity_data(scan["entity_id"], "Batch", "Sub-Order", [["id", "view", "id"], "name"], "parent")
-        sub_order = sub_order[0]
-
-        prod_prop = {"SubOrderVrePhaseSelection" : 297}
-        result_1 = self.api.update_entity_property(
-            sub_order["id"],
-            prod_prop
-        )
-
-        order = self.api.get_related_entity_data(sub_order["id"], "Sub-Order", "Order", [["id", "view", "id"], "name"], "parent")
-        order = order[0]
-
-        result_2 = self.api.update_entity_property(
-            order["id"],
-            {"OrderStatus" : 294}
-        )
+        try:
+            result = self._push_scan_batch(scan, props)
+            self._propagate_parent_phases(scan)
+        except Exception as e:
+            log.warning(f"_push_scan crashed for entity={scan.get('entity_id')}: {e}")
+            result = None
 
         if result is not None:
             scan["result"] = "ok"
@@ -1332,6 +1390,51 @@ class ScannerApp(tk.Tk):
         self.after(0, lambda s=scan: self._update_row(s))
         self.after(0, self._refresh_pending_label)
         self.after(0, lambda m=msg, c=col: self._scan_msg.config(text=m, fg=c))
+
+    def _push_scan_batch(self, scan, props):
+        log.debug(
+            f"Pushing update — entity={scan['entity_id']}  "
+            f"phase_value={scan.get('status_value') or scan.get('status_label')}  "
+            f"prop={props}  attempt={scan['attempts']}"
+        )
+        result = self.api.update_entity_property(scan["entity_id"], props)
+        log.debug(f"update_entity_property response: {result}")
+        return result
+
+    def _propagate_parent_phases(self, scan):
+        """Best-effort parent Sub-Order/Order propagation. Never raises."""
+        try:
+            sub_orders = self._normalise_related(
+                self.api.get_related_entity_data(
+                    scan["entity_id"], "Batch", "Sub-Order",
+                    [["id", "view", "id"], "name"], "parent"))
+            if not sub_orders:
+                log.warning(f"No Sub-Order found for entity={scan['entity_id']} — skipping parent propagation")
+                return
+            sub_order = sub_orders[0]
+            self.api.update_entity_property(
+                sub_order["id"], {"SubOrderVrePhaseSelection": 297})
+
+            orders = self._normalise_related(
+                self.api.get_related_entity_data(
+                    sub_order["id"], "Sub-Order", "Order",
+                    [["id", "view", "id"], "name"], "parent"))
+            if not orders:
+                log.warning(f"No Order found for sub-order={sub_order['id']} — skipping Order status update")
+                return
+            self.api.update_entity_property(
+                orders[0]["id"], {"OrderStatus": 294})
+        except Exception as e:
+            log.warning(f"Parent propagation failed for entity={scan['entity_id']}: {e}")
+
+    @staticmethod
+    def _normalise_related(raw):
+        """get_related_entity_data may return a list or a dict keyed by entity id."""
+        if isinstance(raw, list):
+            return raw
+        if isinstance(raw, dict):
+            return list(raw.values())
+        return []
 
     # ── Shoe-by-shoe scanning ────────────────────────────────────────────────
     def _user_allows_sbss(self):
@@ -1368,6 +1471,19 @@ class ScannerApp(tk.Tk):
         self._do_sbss_attempt(scan)
 
     def _do_sbss_attempt(self, scan):
+        """Resolve entity list and increment the first entity with room. Safe to call on retry."""
+        try:
+            self._do_sbss_attempt_impl(scan)
+        except Exception as e:
+            log.error(f"SBSS worker crashed for barcode={scan.get('batch_id')}: {e}")
+            scan["result"] = "pending"
+            self._persist_scan(scan)
+            self.after(0, lambda s=scan: self._update_row(s))
+            self.after(0, self._refresh_pending_label)
+            self.after(0, lambda b=scan.get('batch_id'): self._scan_msg.config(
+                text=f"⟳ {b} — error, will retry", fg=WARNING))
+
+    def _do_sbss_attempt_impl(self, scan):
         """Resolve entity list and increment the first entity with room. Safe to call on retry."""
         barcode = scan["batch_id"]
         scan["attempts"] = scan.get("attempts", 0) + 1
@@ -1501,10 +1617,23 @@ class ScannerApp(tk.Tk):
     # ── User-switch barcode handling ──────────────────────────────────────────
     def _handle_user_barcode(self, raw):
         user_id = raw[4:]  # strip USR_
-        # Refresh user list so we always have the latest tokens / names
-        if self.api:
-            fetch_users_from_api(self.api, self.settings)
-        user = next((u for u in self.settings["users"] if str(u.get("id", "")) == user_id), None)
+
+        def resolve():
+            # Refresh user list off the UI thread so a slow API never freezes
+            # the scan screen (fetch_users_from_api can block for up to ~200s).
+            if self.api:
+                try:
+                    fetch_users_from_api(self.api, self.settings)
+                except Exception as e:
+                    log.warning(f"User-list refresh failed for USR barcode: {e}")
+            user = next(
+                (u for u in self.settings["users"] if str(u.get("id", "")) == user_id),
+                None)
+            self.after(0, lambda: self._resolve_user_barcode(raw, user_id, user))
+
+        threading.Thread(target=resolve, daemon=True).start()
+
+    def _resolve_user_barcode(self, raw, user_id, user):
         if not user:
             log.warning(f"USR barcode '{raw}' — no user with id={user_id} in settings")
             self._scan_msg.config(text=f"Unknown user ID: {user_id}", fg=DANGER)
@@ -1705,10 +1834,7 @@ class ScannerApp(tk.Tk):
                  text="Or scan  YES  /  NO",
                  font=FONT_XS, bg=SURFACE, fg=TEXT_MUTED).pack(anchor="w", pady=(8, 0))
 
-        # Bind Return for YES/NO during confirmation
-        self.bind("<Return>", lambda e: self._submit_scan())
         self._import_scan_var   = tk.StringVar()
-        self._scan_var          = self._import_scan_var   # reuse global submit
         self._import_scan_entry = tk.Entry(self, textvariable=self._import_scan_var)
         # Hidden entry still captures barcode scanner input
         self._import_scan_entry.place(x=-500, y=-500)
@@ -1719,13 +1845,16 @@ class ScannerApp(tk.Tk):
         threading.Thread(target=self._import_fetch_files, daemon=True).start()
 
     def _import_key_capture(self, event):
-        """Route keystrokes into the hidden entry on the import screen."""
+        """Handle the Enter that ends a barcode scan on the import screen.
+
+        The hidden entry is focused, so scanned characters are inserted into
+        _import_scan_var natively — they must NOT be appended again here.
+        """
         if event.keysym == "Return":
-            self._import_handle_barcode(self._import_scan_var.get().strip())
+            raw = self._import_scan_var.get().strip()
             self._import_scan_var.set("")
-            return
-        if event.char and event.char.isprintable() and not event.state & 0x4:
-            self._import_scan_var.set(self._import_scan_var.get() + event.char)
+            if raw:
+                self._import_handle_barcode(raw)
 
     def _import_handle_barcode(self, raw):
         if not raw:
@@ -1742,7 +1871,7 @@ class ScannerApp(tk.Tk):
             else:
                 self._import_exit()
         else:
-            m = SEL_RE.match(raw)
+            m = self.SEL_RE.match(raw)
             if m:
                 self._import_select(int(m.group(1)))
 
@@ -1991,10 +2120,9 @@ class ScannerApp(tk.Tk):
             except Exception:
                 online = False
 
-        changed = (online != self._net_online)
         self._net_online = online
-        if changed or True:   # always refresh so icon appears on first paint
-            self.after(0, self._refresh_net_icon)
+        # Always refresh so the icon appears on first paint too
+        self.after(0, self._refresh_net_icon)
 
     # ── Connectivity debug mode ────────────────────────────────────────────────
     def _toggle_debug_connectivity(self):

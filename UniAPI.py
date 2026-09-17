@@ -27,7 +27,7 @@ class UniAPI(object):
             r = self.session.post(url, data, timeout=timeout)
         except Exception as e:
             print(e)
-            return {"http_code": 666}
+            return json.dumps({"http_code": 666, "detail": f"network error: {e}"})
         return r.text
 
     def do_get(self, url, data, timeout=10):
@@ -37,7 +37,7 @@ class UniAPI(object):
             r = self.session.get(url, params=data, timeout=timeout)
         except Exception as e:
             print(e)
-            return {"http_code": 666}
+            return json.dumps({"http_code": 666, "detail": f"network error: {e}"})
         return r.text
 
     def get_entity_property(self, entity_id, property_names):

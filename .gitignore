@@ -1,5 +1,7 @@
 scanner_data.json
+settings.json
 launcher.log
 .deps_installed
 backups/
+.idea/
 *.pyc
