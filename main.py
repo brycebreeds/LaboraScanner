@@ -1302,6 +1302,23 @@ class ScannerApp(tk.Tk):
         )
         log.debug(f"update_entity_property response: {result}")
 
+        sub_order = self.api.get_related_entity_data(scan["entity_id"], "Batch", "Sub-Order", [["id", "view", "id"], "name"], "parent")
+        sub_order = sub_order[0]
+
+        prod_prop = {"SubOrderVrePhaseSelection" : 297}
+        result_1 = self.api.update_entity_property(
+            sub_order["id"],
+            prod_prop
+        )
+
+        order = self.api.get_related_entity_data(sub_order["id"], "Sub-Order", "Order", [["id", "view", "id"], "name"], "parent")
+        order = order[0]
+
+        result_2 = self.api.update_entity_property(
+            order["id"],
+            {"OrderStatus" : 294}
+        )
+
         if result is not None:
             scan["result"] = "ok"
             msg, col = f"✓ {scan['batch_id']} updated", SUCCESS
