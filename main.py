@@ -508,7 +508,7 @@ def export_session_snapshot(data, settings, progress_cb=None):
 USERS_ENTITY_ID    = "3"
 USERS_SET_NAME     = "Factory Line User - Org"
 USERS_SETGROUP     = "Factory Line User"
-USERS_PROPERTIES   = [["id", "view", "id"], "name", ["userForceLogin", "view", "token"], "allowShoeByShoeScanning"]
+USERS_PROPERTIES   = [["id", "view", "id"], "name", ["userForceLogin", "view", "token"], "allowShoeByShoeScanning", "allowBoxScanning"]
 USERS_DIRECTION    = "child"
 
 def fetch_users_from_api(api, settings):
@@ -549,7 +549,9 @@ def fetch_users_from_api(api, settings):
             continue
         raw_sbss = u.get("allowShoeByShoeScanning", "")
         allow_sbss = str(raw_sbss).strip().lower() in ("1", "true", "yes")
-        users.append({"id": uid, "name": name, "token": token, "allowShoeByShoeScanning": allow_sbss})
+        raw_box = str(u.get("allowBoxScanning", "") or "").strip()
+        allow_box = str(raw_box).strip().lower() in ("1", "true", "yes")
+        users.append({"id": uid, "name": name, "token": token, "allowShoeByShoeScanning": allow_sbss, "allowBoxScanning": allow_box})
 
     if not users:
         log.warning("fetch_users_from_api — no valid users parsed from API response")
@@ -1138,6 +1140,7 @@ class ScannerApp(tk.Tk):
 
     # ── Scan dispatch ─────────────────────────────────────────────────────────
     BARCODE_RE  = re.compile(r"^BAT_\d+$",         re.IGNORECASE)
+    BOX_RE      = re.compile(r"^BOX_\d+$",         re.IGNORECASE)
     UPDATE_RE = re.compile(r"^UPD_[0-9a-f]{7,12}$", re.IGNORECASE)
     USER_RE     = re.compile(r"^USR_\d+$",          re.IGNORECASE)
     CONFIRM_RE  = re.compile(r"^YES$",       re.IGNORECASE)
@@ -1168,6 +1171,13 @@ class ScannerApp(tk.Tk):
             self._import_select(int(m.group(1)))
         elif self.BARCODE_RE.match(raw):
             self._handle_batch_barcode(raw)
+        elif self.BOX_RE.match(raw):
+            if self._user_allows_box_scanning():
+                self._handle_box_barcode(raw)
+            else:
+                log.warning(f"Box scan rejected — user lacks allowBoxScanning: '{raw}'")
+                self._scan_msg.config(
+                    text="You do not have box scanning permission.", fg=DANGER)
         elif NUMERIC_RE.match(raw) and self._user_allows_sbss():
             self._handle_sbss_barcode(raw)
         else:
@@ -1441,12 +1451,154 @@ class ScannerApp(tk.Tk):
             return list(raw.values())
         return []
 
+    # ── Box barcode scanning ──────────────────────────────────────────────────
+    def _handle_box_barcode(self, raw):
+        normalised = raw.upper()
+        current_user = (self.data.get("session") or {}).get("user_name", "")
+
+        already = next(
+            (s for s in self.data.get("scans", [])
+             if s.get("batch_id", "").upper() == normalised
+             and s.get("user_name") == current_user),
+            None
+        )
+        if already:
+            log.warning(f"Duplicate box barcode rejected: '{raw}' already scanned at {already['time']}")
+            self._scan_msg.config(
+                text=f"Already scanned: {raw}  (scanned at {already['time']})", fg=WARNING)
+            return
+
+        if not self.user_status:
+            log.warning("Box scan attempted but user has no PhaseToEnter value")
+            self._scan_msg.config(
+                text="No PhaseToEnter value on your account.", fg=DANGER)
+            return
+
+        entity_id    = normalised[4:].lstrip("0") or "0"
+        status_label = self.user_status_label or self.user_status
+        log.debug(f"Box barcode '{raw}' → entity_id='{entity_id}'")
+
+        now  = datetime.now()
+        scan = {
+            "id":           f"{now.strftime('%Y%m%d%H%M%S%f')}-{entity_id}",
+            "type":         "box",
+            "date":         now.strftime("%Y-%m-%d"),
+            "time":         now.strftime("%H:%M:%S"),
+            "user_name":    current_user,
+            "batch_id":     raw,
+            "entity_id":    entity_id,
+            "status_label": status_label,
+            "status_value": self.user_status,
+            "shoe":         "…",
+            "size":         "…",
+            "qty":          "…",
+            "result":       "pending",
+            "attempts":     0,
+        }
+
+        log.info(f"Box scan queued — barcode={raw}  entity={entity_id}  phase={self.user_status}  label={status_label}")
+        self.data.setdefault("scans", []).append(scan)
+        save_data(self.data)
+        self._insert_row(scan, prepend=True)
+        self._refresh_pending_label()
+        self._scan_msg.config(text=f"Queued: {raw}", fg=TEXT_DIM)
+
+        threading.Thread(target=self._process_box_scan, args=(scan,), daemon=True).start()
+
+    def _process_box_scan(self, scan):
+        try:
+            self._process_box_scan_impl(scan)
+        except Exception as e:
+            log.error(f"Box scan worker crashed for entity={scan.get('entity_id')}: {e}")
+            scan["result"] = "pending"
+            self._persist_scan(scan)
+            self.after(0, lambda s=scan: self._update_row(s))
+            self.after(0, self._refresh_pending_label)
+            self.after(0, lambda: self._scan_msg.config(
+                text=f"Box scan error, will retry: {scan.get('batch_id')}", fg=DANGER))
+
+    def _process_box_scan_impl(self, scan):
+        entity_id = scan["entity_id"]
+
+        log.debug(f"Verifying box entity exists: entity_id={entity_id}")
+        exists_check = self.api.get_entity_property(entity_id, [["id", "view", "id"]])
+        log.debug(f"Box entity existence check response: {exists_check}")
+        if exists_check is None or exists_check is False:
+            log.warning(f"Box entity check inconclusive (offline?) for entity_id={entity_id} — proceeding anyway")
+        elif not exists_check.get("id"):
+            log.error(f"Box entity not found on system: entity_id={entity_id}")
+            scan["result"] = "fail"
+            scan["shoe"] = scan["size"] = scan["qty"] = "—"
+            self._persist_scan(scan)
+            self.after(0, lambda s=scan: self._update_row(s))
+            self.after(0, self._refresh_pending_label)
+            self.after(0, lambda: self._scan_msg.config(
+                text=f"Box not found: {scan['batch_id']}", fg=DANGER))
+            return
+        else:
+            log.info(f"Box entity confirmed — id={exists_check['id']}")
+
+        log.debug(f"Fetching shoe info for box entity={entity_id}")
+        props = self.api.get_entity_property(entity_id, [
+            ["BatchSuborderShoe", "view"],
+            ["BatchSuborderSize", "view"],
+            ["BatchQty", "view"],
+        ])
+        log.debug(f"Shoe info response: {props}")
+        if props:
+            scan["shoe"] = props.get("BatchSuborderShoe") or "—"
+            scan["size"] = props.get("BatchSuborderSize") or "—"
+            scan["qty"]  = props.get("BatchQty")          or "—"
+            log.info(f"Box shoe info — shoe='{scan['shoe']}'  size='{scan['size']}'  qty='{scan['qty']}'")
+        else:
+            scan["shoe"] = scan["size"] = scan["qty"] = "—"
+            log.warning(f"Could not fetch shoe info for box entity={entity_id}")
+
+        self.after(0, lambda s=scan: self._update_row(s))
+        self._push_box_scan(scan)
+
+    def _push_box_scan(self, scan):
+        scan["attempts"] = scan.get("attempts", 0) + 1
+        api_value  = scan.get("status_value") or scan.get("status_label")
+        props = {"UnitProductionPhase": api_value}
+        log.debug(
+            f"Pushing box update — entity={scan['entity_id']}  "
+            f"phase_value={api_value}  prop={props}  attempt={scan['attempts']}"
+        )
+
+        try:
+            result = self.api.update_entity_property(scan["entity_id"], props)
+            log.debug(f"update_entity_property response: {result}")
+        except Exception as e:
+            log.warning(f"_push_box_scan crashed for entity={scan.get('entity_id')}: {e}")
+            result = None
+
+        if result is not None:
+            scan["result"] = "ok"
+            msg, col = f"✓ {scan['batch_id']} updated", SUCCESS
+            log.info(f"Box update succeeded — entity={scan['entity_id']}")
+        else:
+            scan["result"] = "pending"
+            msg, col = f"✗ {scan['batch_id']} failed — will retry", DANGER
+            log.warning(f"Box update failed — entity={scan['entity_id']}  will retry in {RETRY_INTERVAL}s")
+
+        self._persist_scan(scan)
+        self.after(0, lambda s=scan: self._update_row(s))
+        self.after(0, self._refresh_pending_label)
+        self.after(0, lambda m=msg, c=col: self._scan_msg.config(text=m, fg=c))
+
     # ── Shoe-by-shoe scanning ────────────────────────────────────────────────
     def _user_allows_sbss(self):
         """Return True if the currently logged-in user has allowShoeByShoeScanning set."""
         user_name = (self.data.get("session") or {}).get("user_name", "")
         user = next((u for u in self.settings.get("users", []) if u["name"] == user_name), {})
         return bool(user.get("allowShoeByShoeScanning"))
+
+    def _user_allows_box_scanning(self):
+        """Return True if the currently logged-in user has allowBoxScanning set."""
+        user_name = (self.data.get("session") or {}).get("user_name", "")
+        user = next((u for u in self.settings.get("users", []) if u["name"] == user_name), {})
+        return bool(user.get("allowBoxScanning"))
 
     def _handle_sbss_barcode(self, raw):
         log.info(f"Shoe-by-shoe barcode scanned: '{raw}'")
@@ -1639,6 +1791,8 @@ class ScannerApp(tk.Tk):
                     for scan in pending:
                         if scan.get("type") == "sbss":
                             self._do_sbss_attempt(scan)
+                        elif scan.get("type") == "box":
+                            self._process_box_scan(scan)
                         else:
                             self._push_scan(scan)
                 else:
