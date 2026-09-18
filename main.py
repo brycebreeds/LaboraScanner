@@ -1604,14 +1604,15 @@ class ScannerApp(tk.Tk):
         try:
             batches = self._normalise_related(
                 self.api.get_related_entity_data(
-                    sub_order_id, "Batch", "Sub-Order",
-                    [["id", "view", "id"], ["UnitProductionPhase", "view"]],
+                    sub_order_id, "Batch", "Batch",
+                    [["id", "view", "id"], ["UnitProductionPhase", "data"]],
                     "child"))
             if not batches:
                 log.warning(f"No Batch entities found for Sub-Order={sub_order_id} — skipping phase completion")
                 return
             for batch in batches:
                 phase = str(batch.get("UnitProductionPhase") or "").strip()
+                print(phase)
                 if phase != FINISHING_PHASE:
                     continue
                 result = self.api.update_entity_property(
