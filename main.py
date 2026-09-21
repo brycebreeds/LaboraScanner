@@ -657,6 +657,8 @@ class ScannerApp(tk.Tk):
         self.user_status_label = None
         self.running           = True
         self._pending_user_switch = None   # user dict awaiting confirm barcode
+        self._clear_mode = False                # CLEAR barcode mode active
+        self._pending_clear_scan = None         # scan awaiting YES/NO removal
 
         self._import_buffer = ""   # accumulates keystrokes for global IMPORT catch
         self._debug_banner  = None # connectivity debug mode banner widget
@@ -664,6 +666,8 @@ class ScannerApp(tk.Tk):
         self._net_pill      = None # coloured frame around the icon
         self._net_online    = None # True / False / None (unknown)
         self._topbar        = None # topbar frame ref for bg flash
+        self._clear_banner  = None # clear-mode warning banner widget
+        self._clear_confirm_overlay = None  # clear-mode YES/NO confirmation overlay
         self._style()
         self._boot()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -1078,6 +1082,9 @@ class ScannerApp(tk.Tk):
         # Re-inject the debug banner if connectivity simulation is still active
         if DEBUG_CONNECTIVITY:
             self._show_debug_banner()
+        # Re-inject the clear-mode banner if clear mode is still active
+        if self._clear_mode:
+            self._show_clear_banner()
 
     # ── Log helpers ───────────────────────────────────────────────────────────
     RESULT_ICONS = {
@@ -1153,6 +1160,7 @@ class ScannerApp(tk.Tk):
     CONFIRM_RE  = re.compile(r"^YES$",       re.IGNORECASE)
     CANCEL_RE   = re.compile(r"^NO$",        re.IGNORECASE)
     SEL_RE      = re.compile(r"^SEL_(\d+)$",        re.IGNORECASE)
+    CLEAR_RE    = re.compile(r"^CLEAR$",             re.IGNORECASE)
 
     def _submit_scan(self):
         raw = self._scan_var.get().strip()
@@ -1165,17 +1173,29 @@ class ScannerApp(tk.Tk):
             self._toggle_debug_connectivity()
         elif raw.upper() == "IMPORT":
             self._open_import_screen()
+        elif self.CLEAR_RE.match(raw):
+            self._toggle_clear_mode()
         elif self.UPDATE_RE.match(raw):
             self._handle_update_barcode(raw)
         elif self.USER_RE.match(raw):
             self._handle_user_barcode(raw)
         elif self.CONFIRM_RE.match(raw):
-            self._handle_user_confirm()
+            if self._pending_clear_scan:
+                self._handle_clear_confirm()
+            else:
+                self._handle_user_confirm()
         elif self.CANCEL_RE.match(raw):
-            self._handle_user_cancel()
+            if self._pending_clear_scan:
+                self._dismiss_clear_confirm_overlay()
+                self._scan_msg.config(
+                    text="Removal cancelled.", fg=TEXT_DIM)
+            else:
+                self._handle_user_cancel()
         elif self.SEL_RE.match(raw):
             m = self.SEL_RE.match(raw)
             self._import_select(int(m.group(1)))
+        elif self._clear_mode and self._is_scan_barcode(raw):
+            self._handle_clear_barcode(raw)
         elif self.BARCODE_RE.match(raw):
             self._handle_batch_barcode(raw)
         elif self.BOX_RE.match(raw):
@@ -1854,15 +1874,6 @@ class ScannerApp(tk.Tk):
 
     def _show_user_confirm_overlay(self, user):
         """Show a full-screen overlay with CONFIRM/CANCEL barcodes rendered as images."""
-        try:
-            import barcode as bc
-            from barcode.writer import ImageWriter
-            from PIL import Image, ImageTk
-            import io
-            has_barcode_lib = True
-        except ImportError:
-            has_barcode_lib = False
-
         # Dim overlay frame over the whole window
         overlay = tk.Frame(self, bg=GRAY_800)
         overlay.place(x=0, y=0, relwidth=1, relheight=1)
@@ -1882,12 +1893,26 @@ class ScannerApp(tk.Tk):
 
         barcodes_row = tk.Frame(inner, bg=GRAY_800)
         barcodes_row.pack()
+        self._make_yes_no_barcodes(barcodes_row, GRAY_800)
 
-        def make_barcode_image(value, label_text, parent, bg):
-            col = tk.Frame(parent, bg=bg, padx=20)
+        log.debug("User-switch confirmation overlay shown")
+
+    def _make_yes_no_barcodes(self, parent, bg):
+        """Render YES/NO confirmation barcodes into parent and return it."""
+        try:
+            import barcode as bc
+            from barcode.writer import ImageWriter
+            from PIL import Image, ImageTk
+            import io
+            has_barcode_lib = True
+        except ImportError:
+            has_barcode_lib = False
+
+        def make_barcode_image(value, label_text, col_bg):
+            col = tk.Frame(parent, bg=col_bg, padx=20)
             col.pack(side="left", padx=16)
             tk.Label(col, text=label_text, font=FONT_BOLD,
-                     bg=bg, fg=WHITE).pack(pady=(0, 8))
+                     bg=col_bg, fg=WHITE).pack(pady=(0, 8))
             if has_barcode_lib:
                 try:
                     buf = io.BytesIO()
@@ -1903,7 +1928,7 @@ class ScannerApp(tk.Tk):
                     img = Image.open(buf).convert("RGB")
                     img = img.resize((260, 100), Image.LANCZOS)
                     photo = ImageTk.PhotoImage(img)
-                    lbl = tk.Label(col, image=photo, bg=bg)
+                    lbl = tk.Label(col, image=photo, bg=col_bg)
                     lbl.image = photo  # keep reference
                     lbl.pack()
                     return col
@@ -1911,14 +1936,13 @@ class ScannerApp(tk.Tk):
                     log.warning(f"Barcode render failed for {value}: {e}")
             # Fallback: just show the text value
             tk.Label(col, text=value, font=FONT_MONO,
-                     bg=bg, fg=WHITE,
+                     bg=col_bg, fg=WHITE,
                      relief="solid", padx=12, pady=10).pack()
             return col
 
-        make_barcode_image("YES", "✓  CONFIRM", barcodes_row, SUCCESS)
-        make_barcode_image("NO",  "✗  CANCEL",  barcodes_row, DANGER)
-
-        log.debug("User-switch confirmation overlay shown")
+        make_barcode_image("YES", "✓  CONFIRM", bg)
+        make_barcode_image("NO",  "✗  CANCEL",  bg)
+        return parent
 
     def _dismiss_user_confirm_overlay(self):
         if hasattr(self, "_user_confirm_overlay") and self._user_confirm_overlay:
@@ -1938,6 +1962,123 @@ class ScannerApp(tk.Tk):
         self._dismiss_user_confirm_overlay()
         log.info(f"User switch cancelled — staying as current user")
         self._scan_msg.config(text=f"Switch to {cancelled_name} cancelled", fg=TEXT_DIM)
+
+    # ── Clear-mode (CLEAR barcode) ───────────────────────────────────────────
+    def _is_scan_barcode(self, raw):
+        """True if raw looks like a batch/box/shoe-by-shoe scan barcode."""
+        return bool(self.BARCODE_RE.match(raw) or self.BOX_RE.match(raw)
+                    or NUMERIC_RE.match(raw))
+
+    def _toggle_clear_mode(self):
+        self._clear_mode = not self._clear_mode
+        state = "ON" if self._clear_mode else "OFF"
+        log.warning(f"[CLEAR] Clear mode {state}")
+        if self._clear_mode:
+            self._show_clear_banner()
+            self._scan_msg.config(
+                text="⚠ CLEAR MODE — scan a barcode to remove its last scan",
+                fg=WARNING)
+        else:
+            self._dismiss_clear_confirm_overlay()
+            self._hide_clear_banner()
+            self._scan_msg.config(
+                text="✓ Clear mode off — normal scanning resumed", fg=SUCCESS)
+
+    def _show_clear_banner(self):
+        if getattr(self, "_clear_banner", None):
+            return  # already visible
+        banner = tk.Frame(self, bg=WARNING, padx=16, pady=6)
+        tk.Label(banner, text="⚠  CLEAR MODE ACTIVE — scanning removes scans  ⚠",
+                 font=FONT_BOLD, bg=WARNING, fg=WHITE).pack(side="left")
+        tk.Label(banner, text="Scan CLEAR to exit",
+                 font=FONT_SM, bg=WARNING, fg="#fff8e1").pack(side="right")
+        # Insert after the topbar (index 1 in the pack order)
+        children = self.winfo_children()
+        topbar   = children[0] if children else None
+        banner.pack(fill="x", after=topbar) if topbar else banner.pack(fill="x")
+        self._clear_banner = banner
+
+    def _hide_clear_banner(self):
+        if getattr(self, "_clear_banner", None):
+            try:
+                self._clear_banner.destroy()
+            except Exception:
+                pass
+            self._clear_banner = None
+
+    def _handle_clear_barcode(self, raw):
+        normalised = raw.upper()
+        scan = next(
+            (s for s in reversed(self.data.get("scans", []))
+             if s.get("batch_id", "").upper() == normalised),
+            None
+        )
+        if not scan:
+            log.warning(f"[CLEAR] No scan found for '{raw}'")
+            self._scan_msg.config(
+                text=f"No scan found to clear: {raw}", fg=DANGER)
+            return
+        log.info(f"[CLEAR] Matching scan found — id={scan['id']}  time={scan.get('time')}")
+        self._dismiss_clear_confirm_overlay()
+        self._pending_clear_scan = scan
+        self._show_clear_confirm_overlay(scan)
+
+    def _show_clear_confirm_overlay(self, scan):
+        overlay = tk.Frame(self, bg=GRAY_800)
+        overlay.place(x=0, y=0, relwidth=1, relheight=1)
+        self._clear_confirm_overlay = overlay
+
+        tk.Frame(overlay, bg=ACCENT, height=4).pack(fill="x")
+
+        inner = tk.Frame(overlay, bg=GRAY_800, padx=40, pady=32)
+        inner.pack(expand=True)
+
+        tk.Label(inner, text="Remove this scan?", font=FONT_LARGE,
+                 bg=GRAY_800, fg=WHITE).pack(pady=(0, 12))
+
+        icon   = self.RESULT_ICONS.get(scan.get("result", "pending"), "⟳")
+        detail = (f"{scan.get('time', '?')}   {scan.get('batch_id', '')}\n"
+                  f"{scan.get('shoe', '')}   size {scan.get('size', '')}   "
+                  f"qty {scan.get('qty', '')}\n"
+                  f"result: {icon}")
+        tk.Label(inner, text=detail, font=FONT, bg=GRAY_800, fg=GRAY_400,
+                 justify="center").pack(pady=(0, 28))
+
+        barcodes_row = tk.Frame(inner, bg=GRAY_800)
+        barcodes_row.pack()
+        self._make_yes_no_barcodes(barcodes_row, GRAY_800)
+
+        log.debug("Clear-mode confirmation overlay shown")
+
+    def _dismiss_clear_confirm_overlay(self):
+        if getattr(self, "_clear_confirm_overlay", None):
+            try:
+                self._clear_confirm_overlay.destroy()
+            except Exception:
+                pass
+            self._clear_confirm_overlay = None
+        self._pending_clear_scan = None
+
+    def _handle_clear_confirm(self):
+        scan = self._pending_clear_scan
+        if not scan:
+            return
+        scan_id = scan["id"]
+        self._dismiss_clear_confirm_overlay()
+
+        self.data["scans"] = [
+            s for s in self.data.get("scans", []) if s["id"] != scan_id
+        ]
+        save_data(self.data)
+        try:
+            self._tree.delete(scan_id)
+        except Exception:
+            pass
+        self._refresh_pending_label()
+        log.warning(f"[CLEAR] Removed scan id={scan_id}  batch={scan.get('batch_id')}")
+        self._scan_msg.config(
+            text=f"✓ Removed: {scan.get('batch_id')}  (from {scan.get('time', '?')})",
+            fg=SUCCESS)
 
     # ── Global IMPORT intercept (works on any screen) ────────────────────────
     def _global_import_intercept(self, event):
@@ -2497,6 +2638,9 @@ class ScannerApp(tk.Tk):
         # Banner widget was destroyed above; reset the reference.
         # _show_main will re-inject it if the mode is still active.
         self._debug_banner = None
+        self._clear_banner = None
+        self._clear_confirm_overlay = None
+        self._pending_clear_scan = None
         # Net icon widget is gone; the poll loop checks for None before updating.
         self._net_icon = None
         self._net_pill = None
