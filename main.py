@@ -8,6 +8,7 @@ import io
 import threading
 import time
 import re
+import queue
 import logging
 import subprocess
 import sys
@@ -659,6 +660,9 @@ class ScannerApp(tk.Tk):
         self._pending_user_switch = None   # user dict awaiting confirm barcode
         self._clear_mode = False                # CLEAR barcode mode active
         self._pending_clear_scan = None         # scan awaiting YES/NO removal
+        self._sbss_queue = queue.Queue()        # serialises SBSS attempts (FIFO)
+        self._sbss_in_flight = set()            # scan ids currently being attempted
+        self._sbss_in_flight_lock = threading.Lock()
 
         self._import_buffer = ""   # accumulates keystrokes for global IMPORT catch
         self._debug_banner  = None # connectivity debug mode banner widget
@@ -673,6 +677,7 @@ class ScannerApp(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._start_retry_loop()
         self._start_connectivity_poll()
+        self._start_sbss_worker()
         self.bind_all("<Key>", self._global_import_intercept)
 
     # ── Boot ──────────────────────────────────────────────────────────────────
@@ -1116,17 +1121,28 @@ class ScannerApp(tk.Tk):
 
     def _insert_row(self, scan, prepend=True):
         tag = scan.get("result", "pending")
+        if self._tree.exists(scan["id"]):
+            self._tree.item(scan["id"], values=self._row_values(scan), tags=(tag,))
+            return
         pos = 0 if prepend else "end"
-        self._tree.insert("", pos, iid=scan["id"],
-                          values=self._row_values(scan), tags=(tag,))
+        try:
+            self._tree.insert("", pos, iid=scan["id"],
+                              values=self._row_values(scan), tags=(tag,))
+        except Exception:
+            log.warning(f"Could not insert tree row for {scan['id']}")
 
     def _insert_update_row(self, upd, prepend=True):
+        if self._tree.exists(upd["id"]):
+            return
         pos = 0 if prepend else "end"
         icon = "✓" if upd.get("result") == "ok" else "✗"
-        self._tree.insert("", pos, iid=upd["id"],
-                          values=(upd["time"], upd["barcode"], "— App update —",
-                                  upd.get("commit", ""), "", icon),
-                          tags=("update",))
+        try:
+            self._tree.insert("", pos, iid=upd["id"],
+                              values=(upd["time"], upd["barcode"], "— App update —",
+                                      upd.get("commit", ""), "", icon),
+                              tags=("update",))
+        except Exception:
+            log.warning(f"Could not insert update row for {upd['id']}")
 
     def _update_row(self, scan):
         tag = scan.get("result", "pending")
@@ -1386,8 +1402,34 @@ class ScannerApp(tk.Tk):
         self.after(0, lambda s=scan: self._update_row(s))
         self._push_scan(scan)
 
+    def _populate_scan_details(self, scan):
+        """Fetch shoe/size/qty for a batch scan if they are still placeholders
+        (e.g. queued or failed while offline). Box and SBSS manage their own."""
+        if scan.get("type") in ("sbss", "box"):
+            return
+        if not scan.get("entity_id"):
+            return
+        missing = any(scan.get(k) in ("…", "—", "", None)
+                      for k in ("shoe", "size", "qty"))
+        if not missing:
+            return
+        props = self.api.get_entity_property(scan["entity_id"], [
+            ["BatchSuborderShoe", "view"],
+            ["BatchSuborderSize", "view"],
+            ["BatchQty", "view"],
+        ])
+        if props:
+            scan["shoe"] = props.get("BatchSuborderShoe") or "—"
+            scan["size"] = props.get("BatchSuborderSize") or "—"
+            scan["qty"]  = props.get("BatchQty")          or "—"
+            log.info(f"Populated details on retry — shoe='{scan['shoe']}' "
+                     f"size='{scan['size']}' qty='{scan['qty']}'")
+        else:
+            log.debug(f"Details fetch failed during retry for entity={scan['entity_id']}")
+
     def _push_scan(self, scan):
         scan["attempts"] = scan.get("attempts", 0) + 1
+        self._populate_scan_details(scan)
         api_value  = scan.get("status_value") or scan.get("status_label")
         phase_str  = str(scan.get("status_value") or "").strip()
 
@@ -1632,6 +1674,30 @@ class ScannerApp(tk.Tk):
         self._scan_msg.config(text=f"Looking up {raw}…", fg=TEXT_DIM)
         threading.Thread(target=self._process_sbss_scan, args=(raw,), daemon=True).start()
 
+    def _start_sbss_worker(self):
+        """Drain the SBSS queue one scan at a time so counts/record order stay consistent."""
+        def loop():
+            while self.running:
+                scan = self._sbss_queue.get()
+                try:
+                    if not self.running:
+                        break
+                    self._do_sbss_attempt(scan)
+                except Exception as e:
+                    log.error(f"SBSS worker crashed for barcode={scan.get('batch_id')}: {e}")
+                    try:
+                        scan["result"] = "pending"
+                        self._persist_scan(scan)
+                    except Exception:
+                        pass
+                finally:
+                    self._sbss_queue.task_done()
+        threading.Thread(target=loop, daemon=True).start()
+
+    def _sbss_is_in_flight(self, scan_id):
+        with self._sbss_in_flight_lock:
+            return scan_id in self._sbss_in_flight
+
     def _process_sbss_scan(self, barcode):
         now = datetime.now()
         scan = {
@@ -1648,14 +1714,20 @@ class ScannerApp(tk.Tk):
             "result":    "pending",
             "attempts":  0,
         }
+        # Record immediately so the scan can never be lost, then queue the attempt.
         self.data.setdefault("scans", []).append(scan)
         save_data(self.data)
         self.after(0, lambda s=scan: self._insert_row(s, prepend=True))
         self.after(0, self._refresh_pending_label)
-        self._do_sbss_attempt(scan)
+        self._sbss_queue.put(scan)
 
     def _do_sbss_attempt(self, scan):
         """Resolve entity list and increment the first entity with room. Safe to call on retry."""
+        with self._sbss_in_flight_lock:
+            if scan["id"] in self._sbss_in_flight:
+                log.debug(f"SBSS: scan {scan['id']} already in-flight — skipping duplicate attempt")
+                return
+            self._sbss_in_flight.add(scan["id"])
         try:
             self._do_sbss_attempt_impl(scan)
         except Exception as e:
@@ -1666,6 +1738,9 @@ class ScannerApp(tk.Tk):
             self.after(0, self._refresh_pending_label)
             self.after(0, lambda b=scan.get('batch_id'): self._scan_msg.config(
                 text=f"⟳ {b} — error, will retry", fg=WARNING))
+        finally:
+            with self._sbss_in_flight_lock:
+                self._sbss_in_flight.discard(scan["id"])
 
     def _do_sbss_attempt_impl(self, scan):
         """Resolve entity list and increment the first entity with room. Safe to call on retry."""
@@ -1817,7 +1892,11 @@ class ScannerApp(tk.Tk):
         log.info(f"Flushing {len(pending)} pending scan(s)")
         for scan in pending:
             if scan.get("type") == "sbss":
-                self._do_sbss_attempt(scan)
+                # Never double-process a scan the queue is already working on.
+                if self._sbss_is_in_flight(scan["id"]):
+                    log.debug(f"Jump scan {scan['id']} — already in-flight")
+                    continue
+                self._sbss_queue.put(scan)
             elif scan.get("type") == "box":
                 self._process_box_scan(scan)
             else:
@@ -2629,6 +2708,10 @@ class ScannerApp(tk.Tk):
     def _on_close(self):
         log.info("App closing")
         self.running = False
+        try:
+            save_data(self.data)
+        except Exception as e:
+            log.error(f"Final flush on close failed: {e}")
         self.destroy()
 
     def _clear(self):
