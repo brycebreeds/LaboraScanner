@@ -79,7 +79,7 @@ class UniAPI(object):
             resData["detail"]["failedProps"] = failedProps
             return resData["detail"]
 
-        return False
+        return None
 
     def update_related_entity_property(self, entity_id, property_data, set_name, dir="child"):
         data = property_data

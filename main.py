@@ -896,6 +896,8 @@ class ScannerApp(tk.Tk):
         log.info(f"Session saved for '{user_name}' (status='{status}'  label='{self.user_status_label}')")
         self._show_main()
         self._start_sync_loop()
+        # Kick any pending scans from a previous session immediately
+        threading.Thread(target=self._flush_pending_scans, daemon=True).start()
 
     # ── Session restore ───────────────────────────────────────────────────────
     def _try_restore_session(self, sess):
@@ -937,7 +939,12 @@ class ScannerApp(tk.Tk):
                         "status_label": status_label,
                     })
                     save_data(self.data)
-                    self.after(0, self._show_main)
+                    def finish_restore():
+                        self._show_main()
+                        self._start_sync_loop()
+                        threading.Thread(target=self._flush_pending_scans,
+                                         daemon=True).start()
+                    self.after(0, finish_restore)
                 else:
                     log.warning("Session restore failed — returning to login")
                     self.data["session"] = None
@@ -1777,6 +1784,25 @@ class ScannerApp(tk.Tk):
             log.warning(f"Batch phase completion failed for Sub-Order={sub_order_id}: {e}")
 
     # ── Retry loop ────────────────────────────────────────────────────────────
+    def _flush_pending_scans(self):
+        """Retry every scan still in 'pending' state. Safe from any thread."""
+        if not self.api:
+            log.debug("Flush pending — not logged in, skipping")
+            return
+        pending = [s for s in self.data.get("scans", [])
+                   if s.get("result") == "pending"]
+        if not pending:
+            log.debug("Flush pending — no pending scans")
+            return
+        log.info(f"Flushing {len(pending)} pending scan(s)")
+        for scan in pending:
+            if scan.get("type") == "sbss":
+                self._do_sbss_attempt(scan)
+            elif scan.get("type") == "box":
+                self._process_box_scan(scan)
+            else:
+                self._push_scan(scan)
+
     def _start_retry_loop(self):
         log.debug(f"Retry loop started — interval={RETRY_INTERVAL}s")
         def loop():
@@ -1784,19 +1810,10 @@ class ScannerApp(tk.Tk):
                 time.sleep(RETRY_INTERVAL)
                 if not self.running or not self.api:
                     continue
-                pending = [s for s in self.data.get("scans", [])
-                           if s.get("result") == "pending"]
-                if pending:
-                    log.info(f"Retry loop — retrying {len(pending)} pending scan(s)")
-                    for scan in pending:
-                        if scan.get("type") == "sbss":
-                            self._do_sbss_attempt(scan)
-                        elif scan.get("type") == "box":
-                            self._process_box_scan(scan)
-                        else:
-                            self._push_scan(scan)
-                else:
-                    log.debug("Retry loop — no pending scans")
+                if self._net_online is False:
+                    log.debug("Retry loop — offline, skipping")
+                    continue
+                self._flush_pending_scans()
 
         threading.Thread(target=loop, daemon=True).start()
 
@@ -2306,9 +2323,23 @@ class ScannerApp(tk.Tk):
             except Exception:
                 online = False
 
+        was_offline = self._net_online is False
         self._net_online = online
         # Always refresh so the icon appears on first paint too
         self.after(0, self._refresh_net_icon)
+
+        if online and was_offline:
+            log.info("Connectivity restored — flushing pending scans")
+            threading.Thread(target=self._reconnect_work, daemon=True).start()
+
+    def _reconnect_work(self):
+        """Background job run once connectivity returns: retry pending + SFTP sync."""
+        self._flush_pending_scans()
+        if self.settings:
+            try:
+                run_hourly_sync(self.data, self.settings)
+            except Exception as e:
+                log.error(f"Reconnect hourly sync failed: {e}")
 
     # ── Connectivity debug mode ────────────────────────────────────────────────
     def _toggle_debug_connectivity(self):
