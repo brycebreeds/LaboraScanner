@@ -864,6 +864,8 @@ class ScannerApp(tk.Tk):
 
         self._login_barcode_buffer = ""
         self.bind_all("<Key>", self._global_login_intercept)
+        for sequence in ("<Return>", "<KP_Enter>"):
+            self.bind(sequence, lambda e: self._do_login())
 
         # Populate immediately if users are cached, otherwise fetch in background;
         # always refresh from the API afterward so the user list stays accurate.
@@ -908,7 +910,7 @@ class ScannerApp(tk.Tk):
 
     def _global_login_intercept(self, event):
         if not event.char or not event.char.isprintable():
-            if event.keysym == "Return":
+            if event.keysym in ("Return", "KP_Enter"):
                 raw = self._login_barcode_buffer
                 self._login_barcode_buffer = ""
                 if raw.upper() == "IMPORT":
@@ -1154,7 +1156,8 @@ class ScannerApp(tk.Tk):
         self._scan_msg = tk.Label(scan_frame, text="", font=FONT_SM,
                                   bg=BG, fg=TEXT_DIM)
         self._scan_msg.pack(anchor="w", pady=(6, 0))
-        self.bind("<Return>", lambda e: self._submit_scan())
+        for sequence in ("<Return>", "<KP_Enter>"):
+            self.bind(sequence, lambda e: self._submit_scan())
         self.bind_all("<Key>", self._global_keypress)
 
         # ── Divider ───────────────────────────────────────────────────────────
@@ -1273,7 +1276,7 @@ class ScannerApp(tk.Tk):
     def _global_keypress(self, event):
         if event.widget is self._scan_entry:
             return
-        if event.keysym == "Return":
+        if event.keysym in ("Return", "KP_Enter"):
             self._submit_scan()
             return
         if event.char and event.char.isprintable() and not event.state & 0x4:
@@ -2304,11 +2307,11 @@ class ScannerApp(tk.Tk):
     def _global_import_intercept(self, event):
         """Accumulate keypresses globally; trigger import screen on 'IMPORT\n'."""
         if not event.char or not event.char.isprintable():
-            if event.keysym == "Return" and self._import_buffer.upper() == "IMPORT":
+            if event.keysym in ("Return", "KP_Enter") and self._import_buffer.upper() == "IMPORT":
                 self._import_buffer = ""
                 self._open_import_screen()
                 return
-            if event.keysym == "Return":
+            if event.keysym in ("Return", "KP_Enter"):
                 self._import_buffer = ""
             return
         self._import_buffer += event.char
@@ -2414,7 +2417,7 @@ class ScannerApp(tk.Tk):
         The hidden entry is focused, so scanned characters are inserted into
         _import_scan_var natively — they must NOT be appended again here.
         """
-        if event.keysym == "Return":
+        if event.keysym in ("Return", "KP_Enter"):
             raw = self._import_scan_var.get().strip()
             self._import_scan_var.set("")
             if raw:
