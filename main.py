@@ -587,6 +587,31 @@ def git_current_hash(short=True):
     return None
 
 
+def git_remote_hash():
+    """Fetch origin and return the remote HEAD commit hash, or None."""
+    if not GIT_AVAILABLE:
+        return None
+    try:
+        subprocess.run(
+            [_GIT_EXE] + _GIT_SAFE + ["fetch", "origin"],
+            cwd=SCRIPT_DIR, capture_output=True, text=True, timeout=15
+        )
+    except Exception as e:
+        log.warning(f"git fetch failed: {e}")
+        return None
+    for ref in ("origin/HEAD", "origin/master", "origin/main"):
+        try:
+            result = subprocess.run(
+                [_GIT_EXE] + _GIT_SAFE + ["rev-parse", ref],
+                cwd=SCRIPT_DIR, capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+        except Exception as e:
+            log.warning(f"git_remote_hash({ref}) failed: {e}")
+    return None
+
+
 def git_checkout_and_pull(commit_hash):
     """
     Fetch from origin and checkout the specified commit hash.
@@ -671,6 +696,8 @@ class ScannerApp(tk.Tk):
 
         self._import_buffer = ""   # accumulates keystrokes for global IMPORT catch
         self._login_barcode_buffer = ""   # accumulates keystrokes on login screen
+        self._git_version_lbl = None           # "latest / update available" indicator label
+        self._git_version_check_started = False  # only fetch once per app run
         self._debug_banner  = None # connectivity debug mode banner widget
         self._net_icon      = None # topbar connectivity icon label
         self._net_pill      = None # coloured frame around the icon
@@ -1052,6 +1079,12 @@ class ScannerApp(tk.Tk):
         if current_hash:
             tk.Label(topbar, text=f"v{current_hash}", font=FONT_XS,
                      bg=ACCENT, fg="#f0a0a0").pack(side="left", padx=(12, 0), pady=9)
+            self._git_version_lbl = tk.Label(topbar, text="… checking", font=FONT_XS,
+                                            bg=ACCENT, fg="#f0a0a0")
+            self._git_version_lbl.pack(side="left", padx=(6, 0), pady=9)
+            if not self._git_version_check_started:
+                self._git_version_check_started = True
+                threading.Thread(target=self._check_git_version_latest, daemon=True).start()
 
         right_top = tk.Frame(topbar, bg=ACCENT)
         right_top.pack(side="right")
@@ -2490,6 +2523,31 @@ class ScannerApp(tk.Tk):
                 self._scan_msg.config(text=status, fg=SUCCESS)
         else:
             self._show_login()
+
+    def _check_git_version_latest(self):
+        if not GIT_AVAILABLE:
+            self.after(0, lambda: self._update_git_version_indicator(
+                "? unavailable", GRAY_400))
+            return
+        local = git_current_hash()
+        remote = git_remote_hash()
+        if not remote or not local:
+            self.after(0, lambda: self._update_git_version_indicator(
+                "? unknown", GRAY_400))
+            return
+        if remote == local:
+            text, fg = "✓ latest", "#a6f0b9"
+        else:
+            text, fg = "↑ update available", "#fcd34d"
+        self.after(0, lambda t=text, c=fg: self._update_git_version_indicator(t, c))
+
+    def _update_git_version_indicator(self, text, fg):
+        if not self._git_version_lbl:
+            return
+        try:
+            self._git_version_lbl.config(text=text, fg=fg)
+        except Exception:
+            pass
 
     # ── Hourly sync loop ──────────────────────────────────────────────────────
     def _start_sync_loop(self):
