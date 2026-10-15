@@ -2121,50 +2121,59 @@ class ScannerApp(tk.Tk):
         log.debug("User-switch confirmation overlay shown")
 
     def _make_yes_no_barcodes(self, parent, bg):
-        """Render YES/NO confirmation barcodes into parent and return it."""
+        """Render YES/NO confirmation barcodes directly on Tk canvases."""
+        # Use python-barcode only to generate the Code 128 module pattern.
+        # Drawing modules ourselves avoids Pillow/Tk image and font setup.
         try:
             import barcode as bc
-            from barcode.writer import ImageWriter
-            from PIL import Image, ImageTk
-            import io
             has_barcode_lib = True
-        except ImportError:
+        except Exception:
             has_barcode_lib = False
 
-        def make_barcode_image(value, label_text, col_bg):
-            col = tk.Frame(parent, bg=col_bg, padx=20)
+        def make_barcode(value, label_text):
+            col = tk.Frame(parent, bg=bg, padx=20)
             col.pack(side="left", padx=16)
             tk.Label(col, text=label_text, font=FONT_BOLD,
-                     bg=col_bg, fg=WHITE).pack(pady=(0, 8))
-            if has_barcode_lib:
-                try:
-                    buf = io.BytesIO()
-                    code = bc.get("code128", value, writer=ImageWriter())
-                    code.write(buf, options={
-                        "module_height": 18,
-                        "text_distance": 4,
-                        "font_size": 11,
-                        "quiet_zone": 6,
-                        "write_text": True,
-                    })
-                    buf.seek(0)
-                    img = Image.open(buf).convert("RGB")
-                    img = img.resize((260, 100), Image.LANCZOS)
-                    photo = ImageTk.PhotoImage(img)
-                    lbl = tk.Label(col, image=photo, bg=col_bg)
-                    lbl.image = photo  # keep reference
-                    lbl.pack()
-                    return col
-                except Exception as e:
-                    log.warning(f"Barcode render failed for {value}: {e}")
-            # Fallback: just show the text value
+                    bg=bg, fg=WHITE).pack(pady=(0, 8))
+
+            if not has_barcode_lib:
+                tk.Label(col, text=value, font=FONT_MONO,
+                        bg=bg, fg=WHITE, relief="solid",
+                        padx=12, pady=10).pack()
+                return col
+
+            try:
+                bar_string = bc.get("code128", value).build()[0]
+            except Exception as e:
+                log.warning("Barcode pattern build failed for %s: %s" % (value, e))
+                tk.Label(col, text=value, font=FONT_MONO,
+                        bg=bg, fg=WHITE, relief="solid",
+                        padx=12, pady=10).pack()
+                return col
+
+            quiet = 4
+            pattern = ("0" * quiet) + bar_string + ("0" * quiet)
+            canvas_width = 260
+            canvas_height = 80
+            module_width = max(1, canvas_width // len(pattern))
+            bar_width = module_width * len(pattern)
+            x_offset = max(0, (canvas_width - bar_width) // 2)
+            canvas = tk.Canvas(col, width=canvas_width, height=canvas_height,
+                             bg=bg, highlightthickness=0, bd=0)
+            canvas.pack()
+            x = x_offset
+            for module in pattern:
+                if module == "1":
+                    canvas.create_rectangle(
+                        x, 8, x + module_width, canvas_height - 8,
+                        fill="black", outline="black")
+                x += module_width
             tk.Label(col, text=value, font=FONT_MONO,
-                     bg=col_bg, fg=WHITE,
-                     relief="solid", padx=12, pady=10).pack()
+                    bg=bg, fg=WHITE).pack(pady=(4, 0))
             return col
 
-        make_barcode_image("YES", "✓  CONFIRM", bg)
-        make_barcode_image("NO",  "✗  CANCEL",  bg)
+        make_barcode("YES", "CONFIRM")
+        make_barcode("NO", "CANCEL")
         return parent
 
     def _dismiss_user_confirm_overlay(self):
