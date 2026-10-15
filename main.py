@@ -714,6 +714,8 @@ class ScannerApp(tk.Tk):
         self._login_barcode_buffer = ""   # accumulates keystrokes on login screen
         self._git_version_lbl = None           # "latest / update available" indicator label
         self._git_version_check_started = False  # only fetch once per app run
+        self._git_version_text = "... checking"    # cached indicator text
+        self._git_version_fg = GRAY_400         # cached indicator color
         self._debug_banner  = None # connectivity debug mode banner widget
         self._net_icon      = None # topbar connectivity icon label
         self._net_pill      = None # coloured frame around the icon
@@ -1095,8 +1097,8 @@ class ScannerApp(tk.Tk):
         if current_hash:
             tk.Label(topbar, text=f"v{current_hash}", font=FONT_XS,
                      bg=ACCENT, fg="#f0a0a0").pack(side="left", padx=(12, 0), pady=9)
-            self._git_version_lbl = tk.Label(topbar, text="… checking", font=FONT_XS,
-                                            bg=ACCENT, fg="#f0a0a0")
+            self._git_version_lbl = tk.Label(topbar, text=self._git_version_text, font=FONT_XS,
+                                            bg=ACCENT, fg=self._git_version_fg)
             self._git_version_lbl.pack(side="left", padx=(6, 0), pady=9)
             if not self._git_version_check_started:
                 self._git_version_check_started = True
@@ -2593,12 +2595,18 @@ class ScannerApp(tk.Tk):
                 "? unknown", GRAY_400))
 
     def _update_git_version_indicator(self, text, fg):
+        self._git_version_text = text
+        self._git_version_fg = fg
         if not self._git_version_lbl:
+            return
+        if not self._git_version_lbl.winfo_exists():
+            log.debug("Git version indicator widget gone; cached result is %s" % text)
             return
         try:
             self._git_version_lbl.config(text=text, fg=fg)
-        except Exception:
-            pass
+            log.debug("Git version indicator updated: %s" % text)
+        except Exception as e:
+            log.warning("Could not update git version indicator: %s" % e)
 
     # ── Hourly sync loop ──────────────────────────────────────────────────────
     def _start_sync_loop(self):
