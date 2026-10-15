@@ -588,13 +588,28 @@ def git_current_hash(short=True):
 
 
 def git_remote_hash():
-    """Fetch origin and return the remote HEAD commit hash, or None."""
+    """Return the remote HEAD commit hash without mutating local refs.
+
+    Tries a fast read-only ls-remote first; falls back to fetch + rev-parse.
+    Returns None if git is unavailable or every method fails.
+    """
     if not GIT_AVAILABLE:
         return None
     try:
+        result = subprocess.run(
+            [_GIT_EXE] + _GIT_SAFE + ["ls-remote", "origin", "HEAD"],
+            cwd=SCRIPT_DIR, capture_output=True, text=True, timeout=8
+        )
+        if result.returncode == 0:
+            token = (result.stdout or "").split()
+            if token and len(token[0]) >= 7:
+                return token[0].strip()
+    except Exception as e:
+        log.warning(f"git ls-remote failed: {e}")
+    try:
         subprocess.run(
             [_GIT_EXE] + _GIT_SAFE + ["fetch", "origin"],
-            cwd=SCRIPT_DIR, capture_output=True, text=True, timeout=15
+            cwd=SCRIPT_DIR, capture_output=True, text=True, timeout=8
         )
     except Exception as e:
         log.warning(f"git fetch failed: {e}")
@@ -603,7 +618,7 @@ def git_remote_hash():
         try:
             result = subprocess.run(
                 [_GIT_EXE] + _GIT_SAFE + ["rev-parse", ref],
-                cwd=SCRIPT_DIR, capture_output=True, text=True, timeout=10
+                cwd=SCRIPT_DIR, capture_output=True, text=True, timeout=8
             )
             if result.returncode == 0 and result.stdout.strip():
                 return result.stdout.strip()
@@ -2528,21 +2543,29 @@ class ScannerApp(tk.Tk):
             self._show_login()
 
     def _check_git_version_latest(self):
-        if not GIT_AVAILABLE:
-            self.after(0, lambda: self._update_git_version_indicator(
-                "? unavailable", GRAY_400))
-            return
-        local = git_current_hash(short=False)
-        remote = git_remote_hash()
-        if not remote or not local:
+        log.debug("Git version check started")
+        try:
+            if not GIT_AVAILABLE:
+                self.after(0, lambda: self._update_git_version_indicator(
+                    "? unavailable", GRAY_400))
+                return
+            local = git_current_hash(short=False)
+            remote = git_remote_hash()
+            if not remote or not local:
+                self.after(0, lambda: self._update_git_version_indicator(
+                    "? unknown", GRAY_400))
+                return
+            if remote == local:
+                text, fg = "✓ latest", "#a6f0b9"
+            else:
+                text, fg = "↑ update available", "#fcd34d"
+            log.info("Git version check done: local=%s remote=%s -> %s"
+                     % (local[:8], (remote or '')[:8], text))
+            self.after(0, lambda t=text, c=fg: self._update_git_version_indicator(t, c))
+        except Exception as e:
+            log.error("Git version check failed: %s" % e)
             self.after(0, lambda: self._update_git_version_indicator(
                 "? unknown", GRAY_400))
-            return
-        if remote == local:
-            text, fg = "✓ latest", "#a6f0b9"
-        else:
-            text, fg = "↑ update available", "#fcd34d"
-        self.after(0, lambda t=text, c=fg: self._update_git_version_indicator(t, c))
 
     def _update_git_version_indicator(self, text, fg):
         if not self._git_version_lbl:
