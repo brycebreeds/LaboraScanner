@@ -1273,6 +1273,7 @@ class ScannerApp(tk.Tk):
     CANCEL_RE   = re.compile(r"^NO$",        re.IGNORECASE)
     SEL_RE      = re.compile(r"^SEL_(\d+)$",        re.IGNORECASE)
     CLEAR_RE    = re.compile(r"^CLEAR$",             re.IGNORECASE)
+    CLR_PENDING_RE = re.compile(r"^CLR_PENDING$",     re.IGNORECASE)
 
     def _submit_scan(self):
         raw = self._scan_var.get().strip()
@@ -1287,6 +1288,8 @@ class ScannerApp(tk.Tk):
             self._open_import_screen()
         elif self.CLEAR_RE.match(raw):
             self._toggle_clear_mode()
+        elif self.CLR_PENDING_RE.match(raw):
+            self._clear_pending_scans()
         elif self.UPDATE_RE.match(raw):
             self._handle_update_barcode(raw)
         elif self.USER_RE.match(raw):
@@ -2860,7 +2863,22 @@ class ScannerApp(tk.Tk):
 
         threading.Thread(target=do_switch, daemon=True).start()
 
-        # ── Cleanup ───────────────────────────────────────────────────────────────
+    def _clear_pending_scans(self):
+        pending = [s for s in self.data.get("scans", [])
+                   if s.get("result") == "pending"]
+        if not pending:
+            self._scan_msg.config(text="No pending scans to clear.", fg=TEXT_DIM)
+            return
+        self.data["scans"] = [s for s in self.data.get("scans", [])
+                              if s.get("result") != "pending"]
+        save_data(self.data)
+        self._refresh_scan_log_view()
+        self._refresh_pending_label()
+        log.warning("[CLR_PENDING] Removed %d pending scan(s)" % len(pending))
+        self._scan_msg.config(
+            text="Removed %d pending scan(s)" % len(pending), fg=SUCCESS)
+
+    # ── Cleanup ───────────────────────────────────────────────────────────────
     def _on_close(self):
         log.info("App closing")
         self.running = False
