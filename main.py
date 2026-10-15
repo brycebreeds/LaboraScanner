@@ -13,7 +13,7 @@ import logging
 import subprocess
 import sys
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from UniAPI import UniAPI
@@ -698,6 +698,7 @@ class ScannerApp(tk.Tk):
 
         self.settings          = None
         self.data              = load_data()
+        self._clear_expired_pending_scans()
         self.api               = None
         self.user_status       = None
         self.user_status_label = None
@@ -1995,6 +1996,8 @@ class ScannerApp(tk.Tk):
     # ── Retry loop ────────────────────────────────────────────────────────────
     def _flush_pending_scans(self):
         """Retry every scan still in 'pending' state. Safe from any thread."""
+        self.data              = load_data()
+        self._clear_expired_pending_scans()
         if not self.api:
             log.debug("Flush pending — not logged in, skipping")
             return
@@ -2015,6 +2018,28 @@ class ScannerApp(tk.Tk):
                 self._process_box_scan(scan)
             else:
                 self._push_scan(scan)
+
+    def _clear_expired_pending_scans(self):
+        try:
+            cutoff = (datetime.now().date() - timedelta(days=7)).strftime("%Y%m%d")
+        except Exception as e:
+            log.warning("Could not compute pending-scan expiry cutoff: %s" % e)
+            return
+        scans = self.data.get("scans", [])
+        expired_ids = {
+            s.get("id") for s in scans
+            if s.get("result") == "pending" and _scan_date(s) < cutoff
+        }
+        if not expired_ids:
+            return
+        self.data["scans"] = [
+            s for s in scans if s.get("id") not in expired_ids
+        ]
+        save_data(self.data)
+        log.info("Auto-cleared %d pending scan(s) older than 7 days" % len(expired_ids))
+        if getattr(self, "_tree", None):
+            self.after(0, self._refresh_scan_log_view)
+            self.after(0, self._refresh_pending_label)
 
     def _start_retry_loop(self):
         log.debug(f"Retry loop started — interval={RETRY_INTERVAL}s")
