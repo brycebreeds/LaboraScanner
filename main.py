@@ -2529,7 +2529,7 @@ class ScannerApp(tk.Tk):
             self.after(0, lambda: self._update_git_version_indicator(
                 "? unavailable", GRAY_400))
             return
-        local = git_current_hash()
+        local = git_current_hash(short=False)
         remote = git_remote_hash()
         if not remote or not local:
             self.after(0, lambda: self._update_git_version_indicator(
