@@ -398,7 +398,7 @@ def run_hourly_sync(data, settings):
     sftp_cfg = settings.get("sftp")
     if not sftp_cfg or not sftp_cfg.get("host"):
         log.debug("run_hourly_sync — no SFTP config, skipping")
-        return
+        return False
 
     instance_id    = settings.get("instance_id", "unknown")
     remote_base    = sftp_cfg.get("remote_dir", "/").rstrip("/")
@@ -409,9 +409,10 @@ def run_hourly_sync(data, settings):
         transport, sftp = _sftp_connect(sftp_cfg)
     except Exception as e:
         log.error(f"run_hourly_sync — SFTP connect failed: {e}")
-        return
+        return False
 
     try:
+        ok = True
         _sftp_makedirs(sftp, remote_daily)
         _sftp_makedirs(sftp, remote_backups)
 
@@ -428,6 +429,7 @@ def run_hourly_sync(data, settings):
                 log.info(f"Daily CSV → {date_str}_{instance_id}_scans.csv  ({count} rows)")
             except Exception as e:
                 log.error(f"Daily CSV upload failed ({date_str}): {e}")
+                ok = False
 
         # ── Backup sync ───────────────────────────────────────────────────────
         BACKUP_DIR.mkdir(parents=True, exist_ok=True)
@@ -436,6 +438,7 @@ def run_hourly_sync(data, settings):
         except Exception as e:
             log.warning(f"Could not list remote backups: {e}")
             on_server = set()
+            ok = False
 
         uploaded = 0
         for f in sorted(BACKUP_DIR.glob("*.csv")):
@@ -446,10 +449,12 @@ def run_hourly_sync(data, settings):
                     uploaded += 1
                 except Exception as e:
                     log.error(f"Backup sync failed ({f.name}): {e}")
+                    ok = False
             else:
                 log.debug(f"Backup already on server — {f.name}")
 
         log.info(f"run_hourly_sync done — {len(dates)} daily, {uploaded} backups uploaded")
+        return ok
 
     finally:
         try:
@@ -2492,7 +2497,11 @@ class ScannerApp(tk.Tk):
         def loop():
             if self.running and self.settings:
                 try:
-                    run_hourly_sync(self.data, self.settings)
+                    synced_ids = {s.get("id") for s in self.data.get("scans", [])
+                                  if s.get("result") == "ok" and _scan_date(s) < datetime.now().strftime("%Y%m%d")}
+                    success = run_hourly_sync(self.data, self.settings)
+                    if success and synced_ids:
+                        self.after(0, lambda ids=synced_ids: self._clear_synced_scans(ids))
                 except Exception as e:
                     log.error(f"Sync loop initial run failed: {e}")
             while self.running:
@@ -2501,10 +2510,41 @@ class ScannerApp(tk.Tk):
                     break
                 log.info("Sync loop — running hourly sync")
                 try:
-                    run_hourly_sync(self.data, self.settings)
+                    synced_ids = {s.get("id") for s in self.data.get("scans", [])
+                                  if s.get("result") == "ok" and _scan_date(s) < datetime.now().strftime("%Y%m%d")}
+                    success = run_hourly_sync(self.data, self.settings)
+                    if success and synced_ids:
+                        self.after(0, lambda ids=synced_ids: self._clear_synced_scans(ids))
                 except Exception as e:
                     log.error(f"Sync loop error: {e}")
         threading.Thread(target=loop, daemon=True).start()
+
+    def _clear_synced_scans(self, synced_ids):
+        today = datetime.now().strftime("%Y%m%d")
+        scans = self.data.get("scans", [])
+        remaining = [s for s in scans
+                    if not (s.get("id") in synced_ids and _scan_date(s) < today)]
+        removed = len(scans) - len(remaining)
+        if removed <= 0:
+            return
+        self.data["scans"] = remaining
+        try:
+            save_data(self.data)
+        except Exception as e:
+            log.error(f"Could not save after clearing synced scans: {e}")
+            return
+        log.info(f"Cleared {removed} synced scan(s) from local log")
+        self._refresh_scan_log_view()
+
+    def _refresh_scan_log_view(self):
+        if not getattr(self, "_tree", None):
+            return
+        try:
+            for item in self._tree.get_children():
+                self._tree.delete(item)
+            self._load_log()
+        except Exception as e:
+            log.warning(f"Could not refresh scan log view: {e}")
 
     # ── Export overlay ─────────────────────────────────────────────────────────
     def _show_export_overlay(self, message="Working…"):
