@@ -665,6 +665,7 @@ class ScannerApp(tk.Tk):
         self._sbss_in_flight_lock = threading.Lock()
 
         self._import_buffer = ""   # accumulates keystrokes for global IMPORT catch
+        self._login_barcode_buffer = ""   # accumulates keystrokes on login screen
         self._debug_banner  = None # connectivity debug mode banner widget
         self._net_icon      = None # topbar connectivity icon label
         self._net_pill      = None # coloured frame around the icon
@@ -811,13 +812,18 @@ class ScannerApp(tk.Tk):
                                      command=self._do_login, state="disabled")
         self._login_btn.pack(fill="x")
 
-        self.bind("<Return>", lambda e: self._do_login())
+        self._login_barcode_buffer = ""
+        self.bind_all("<Key>", self._global_login_intercept)
 
-        # Populate immediately if users are cached, otherwise fetch in background.
+        # Populate immediately if users are cached, otherwise fetch in background;
+        # always refresh from the API afterward so the user list stays accurate.
         if self.settings.get("users"):
             self._populate_login_combo()
-        else:
-            threading.Thread(target=self._fetch_users_for_login, daemon=True).start()
+        threading.Thread(target=self._fetch_users_for_login, daemon=True).start()
+
+        self._login_combo.bind("<<ComboboxSelected>>",
+                               lambda e: self._login_btn.config(
+                                   state="normal" if self._user_var.get() else "disabled"))
 
     def _fetch_users_for_login(self):
         """Background fetch used when no users are cached (e.g. first run or sign-out)."""
@@ -843,15 +849,67 @@ class ScannerApp(tk.Tk):
                 text="Could not load users. Check network / settings.json.", fg=DANGER)
             return
         last = (self.data.get("session") or {}).get("user_name", "")
-        self._user_var.set(last if last in user_names else user_names[0])
+        self._user_var.set(last if last in user_names else "")
         self._login_combo.config(values=user_names, state="readonly")
-        self._login_btn.config(state="normal")
+        self._login_btn.config(state="normal" if self._user_var.get() else "disabled")
         self._login_err.config(text="", fg=DANGER)
         self._login_combo.focus()
         log.debug(f"Login combo populated with {len(user_names)} user(s)")
 
+    def _global_login_intercept(self, event):
+        if not event.char or not event.char.isprintable():
+            if event.keysym == "Return":
+                raw = self._login_barcode_buffer
+                self._login_barcode_buffer = ""
+                if raw.upper() == "IMPORT":
+                    self._open_import_screen()
+                    return "break"
+                if raw.upper().startswith("USR_"):
+                    user_id = raw[4:]
+                    self._login_err.config(text="Refreshing users…", fg=TEXT_DIM)
+                    threading.Thread(target=self._login_by_badge, args=(user_id,), daemon=True).start()
+                    return "break"
+                if self._user_var.get():
+                    self._do_login()
+                else:
+                    self._login_err.config(text="Select a user or scan a badge.", fg=DANGER)
+                return "break"
+            return
+        self._login_barcode_buffer += event.char
+        if len(self._login_barcode_buffer) > 64:
+            self._login_barcode_buffer = self._login_barcode_buffer[-64:]
+        return
+
+    def _login_by_badge(self, user_id):
+        try:
+            seed_token = ""
+            for u in (self.settings.get("users") or []):
+                if u.get("token"):
+                    seed_token = u["token"]
+                    break
+            tmp_api = UniAPI(self.settings["baseurl"], token=seed_token)
+            fetch_users_from_api(tmp_api, self.settings)
+        except Exception as e:
+            log.warning(f"_login_by_badge refresh failed: {e}")
+        user = next((u for u in (self.settings.get("users") or [])
+                     if str(u.get("id", "")) == user_id), None)
+        if not user:
+            self.after(0, lambda: self._login_err.config(
+                text=f"Unknown user ID: {user_id}", fg=DANGER))
+            return
+        def finish():
+            self._user_var.set(user["name"])
+            names = [u["name"] for u in (self.settings.get("users") or [])]
+            self._login_combo.config(values=names, state="readonly")
+            self._login_btn.config(state="normal")
+            self._do_login()
+        self.after(0, finish)
+
     def _do_login(self):
         name = self._user_var.get()
+        if not name:
+            self._login_err.config(text="Select a user or scan a badge.", fg=DANGER)
+            return
         user = next((u for u in self.settings["users"] if u["name"] == name), None)
         if not user:
             log.warning(f"User '{name}' not found in settings")
